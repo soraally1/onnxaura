@@ -4,8 +4,27 @@ import re
 import json
 import base64
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 from PIL import Image
 from groq import AsyncGroq
+
+# Automatically load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if env_file.exists():
+        load_dotenv(dotenv_path=env_file)
+except Exception:
+    pass
+
+def get_groq_api_key(explicit_key: Optional[str] = None) -> Optional[str]:
+    """Resolves Groq API key checking explicit parameter, GROQ_AURA1, and GROQ_API_KEY."""
+    return (
+        explicit_key
+        or os.environ.get("GROQ_AURA1")
+        or os.environ.get("GROQ_API_KEY")
+    )
+
 from api.scin_taxonomy import (
     FITZPATRICK_TYPES,
     SCIN_TEXTURES,
@@ -138,11 +157,11 @@ async def analyze_skin_with_groq(
     Performs multimodal skin condition inference using Groq AI with model qwen/qwen3.8-27b.
     Validates against SCIN dataset standards.
     """
-    active_key = api_key or os.environ.get("GROQ_API_KEY")
+    active_key = get_groq_api_key(api_key)
     if not active_key:
         raise ValueError(
-            "GROQ_API_KEY tidak ditemukan. Mohon sertakan API Key melalui environment variable "
-            "atau header 'X-Groq-Api-Key'."
+            "Groq API Key tidak ditemukan. Mohon set GROQ_AURA1 / GROQ_API_KEY di file .env "
+            "atau sertakan melalui header 'X-Groq-Api-Key'."
         )
 
     # Process image

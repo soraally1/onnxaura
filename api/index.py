@@ -1,7 +1,17 @@
 import os
 import json
 import base64
+from pathlib import Path
 from typing import Optional, Dict, Any
+
+# Load environment variables from .env
+try:
+    from dotenv import load_dotenv
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if env_file.exists():
+        load_dotenv(dotenv_path=env_file)
+except Exception:
+    pass
 
 # Configure environment directories for serverless environments (e.g. Vercel)
 os.environ['JOBLIB_TEMP_FOLDER'] = '/tmp'

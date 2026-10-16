@@ -8,3 +8,4 @@ numpy
 groq
 pydantic
 pillow
+python-dotenv
