@@ -8,6 +8,11 @@ from pathlib import Path
 from PIL import Image
 from groq import AsyncGroq
 
+try:
+    from api.skin_cv import run_skin_cv_pipeline
+except ImportError:
+    from skin_cv import run_skin_cv_pipeline
+
 # Automatically load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -164,11 +169,32 @@ async def analyze_skin_with_groq(
             "atau sertakan melalui header 'X-Groq-Api-Key'."
         )
 
-    # Process image
+    # 1. Execute Python Computer Vision preprocessing, auto face geometry fitting & Wood's Lamp synthesis
+    cv_analysis: Optional[Dict[str, Any]] = None
+    try:
+        cv_analysis = run_skin_cv_pipeline(image_bytes)
+    except Exception as cv_err:
+        cv_analysis = None
+
+    # 2. Process image for Groq Vision
     image_data_url = prepare_image_base64(image_bytes)
 
-    # Build contextual user prompt with rich mobility & environmental data from aurabackend
+    # 3. Build contextual user prompt enriched with Wood's Lamp & CV biomarkers
     user_prompt = "Berikut adalah foto kondisi kulit untuk dianalisis terhadap dampak polusi, cuaca, dan radiasi matahari sesuai taksonomi SCIN."
+    if cv_analysis:
+        cv_m = cv_analysis.get("cv_metrics", {})
+        wl_notes = "; ".join(cv_analysis.get("woods_lamp_findings", []))
+        geom_det = "terdeteksi otomatis" if cv_analysis.get("face_geometry", {}).get("detected") else "estimasi terpusat"
+        user_prompt += (
+            "\n\nHasil Pra-Pemrosesan Komputer Visi & Simulasi Wood's Lamp (365nm UV):\n"
+            f"- Geometri Wajah & Pemetaan Zona: {geom_det} (Cakupan kulit: {cv_m.get('skin_coverage_pct', 0)}%)\n"
+            f"- Indeks Fluoresensi Sebum T-Zone (Wood's Lamp): {cv_m.get('tzone_sebum_fluorescence', 0)}/100\n"
+            f"- Indeks Eritema / Kemerahan Vaskular: {cv_m.get('erythema_index', 0)}/100\n"
+            f"- Kontras Penyerapan Melanin UV: {cv_m.get('melanin_uv_contrast', 0)}/100\n"
+            f"- Skor Keseragaman Tekstur Permukaan: {cv_m.get('uniformity_score', 0)}/100\n"
+            f"- Temuan Wood's Lamp: {wl_notes}\n"
+            "Gunakan metrik objektif Wood's Lamp dan pemetaan zona tersebut untuk memperdalam analisis kondisi kulit dan barrier.\n"
+        )
     if context:
         user_prompt += "\n\nKonteks Lingkungan, Mobilitas, & Profil Pasien (dari AURA Backend):\n"
         
@@ -292,5 +318,8 @@ async def analyze_skin_with_groq(
     fst = parsed.get("fitzpatrick_skin_type")
     if fst in FITZPATRICK_TYPES:
         parsed["fitzpatrick_details"] = FITZPATRICK_TYPES[fst]
+
+    if cv_analysis is not None:
+        parsed["cv_analysis"] = cv_analysis
 
     return parsed
