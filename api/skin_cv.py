@@ -1,11 +1,10 @@
 import base64
 import io
 import math
-from collections import deque
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 
 def _clamp(val: float, lo: float, hi: float) -> float:
@@ -35,106 +34,14 @@ def _gaussian_blur_rgb(arr3d: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def _grey_closing_2d(arr2d: np.ndarray, size: int = 5) -> np.ndarray:
-    """Morphological grayscale closing (dilation followed by erosion) via Pillow C filters."""
+    """Morphological grayscale closing (dilation -> erosion) via Pillow C filters."""
     u8 = np.clip(arr2d, 0, 255).astype(np.uint8)
     img = Image.fromarray(u8, mode="L")
     closed = img.filter(ImageFilter.MaxFilter(size)).filter(ImageFilter.MinFilter(size))
     return np.array(closed, dtype=np.float32)
 
 
-def _morph_clean_mask(mask: np.ndarray) -> np.ndarray:
-    """Applies binary morphological opening -> closing via Pillow C filters."""
-    u8 = (mask.astype(np.uint8) * 255)
-    img = Image.fromarray(u8, mode="L")
-    opened = img.filter(ImageFilter.MinFilter(5)).filter(ImageFilter.MaxFilter(5))
-    closed = opened.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(7))
-    return np.array(closed, dtype=np.uint8) > 127
-
-
-def _largest_component_and_fill_holes(mask: np.ndarray) -> Tuple[np.ndarray, bool]:
-    """
-    Finds the largest centrally weighted connected component in pure Python/NumPy
-    on a compact downsampled grid (<=96px) for sub-5ms serverless performance.
-    """
-    h, w = mask.shape
-    step = max(1, min(h, w) // 72)
-    small = mask[::step, ::step]
-    sh, sw = small.shape
-
-    visited = np.zeros((sh, sw), dtype=bool)
-    best_pixels: List[Tuple[int, int]] = []
-    best_score = -1.0
-    img_cx, img_cy = sw * 0.5, sh * 0.46
-    min_area = max(12, int(sh * sw * 0.035))
-
-    for sy in range(sh):
-        for sx in range(sw):
-            if not small[sy, sx] or visited[sy, sx]:
-                continue
-            q = deque([(sy, sx)])
-            visited[sy, sx] = True
-            comp: List[Tuple[int, int]] = []
-            sum_y = 0
-            sum_x = 0
-            while q:
-                cy, cx = q.popleft()
-                comp.append((cy, cx))
-                sum_y += cy
-                sum_x += cx
-                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                    if 0 <= ny < sh and 0 <= nx < sw and small[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = True
-                        q.append((ny, nx))
-
-            area = len(comp)
-            if area < min_area:
-                continue
-            mean_y = sum_y / float(area)
-            mean_x = sum_x / float(area)
-            dist_penalty = math.hypot((mean_x - img_cx) / max(1, sw), (mean_y - img_cy) / max(1, sh))
-            score = area * max(0.35, 1.0 - 0.75 * dist_penalty)
-            if score > best_score:
-                best_score = score
-                best_pixels = comp
-
-    if not best_pixels:
-        return np.zeros((h, w), dtype=bool), False
-
-    comp_small = np.zeros((sh, sw), dtype=np.uint8)
-    for cy, cx in best_pixels:
-        comp_small[cy, cx] = 255
-
-    # Fill internal holes inside component using border flood fill on small mask
-    outside = np.zeros((sh, sw), dtype=bool)
-    q_bg: deque = deque()
-    for bx in range(sw):
-        if comp_small[0, bx] == 0:
-            outside[0, bx] = True
-            q_bg.append((0, bx))
-        if comp_small[sh - 1, bx] == 0 and not outside[sh - 1, bx]:
-            outside[sh - 1, bx] = True
-            q_bg.append((sh - 1, bx))
-    for by in range(sh):
-        if comp_small[by, 0] == 0 and not outside[by, 0]:
-            outside[by, 0] = True
-            q_bg.append((by, 0))
-        if comp_small[by, sw - 1] == 0 and not outside[by, sw - 1]:
-            outside[by, sw - 1] = True
-            q_bg.append((by, sw - 1))
-
-    while q_bg:
-        cy, cx = q_bg.popleft()
-        for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-            if 0 <= ny < sh and 0 <= nx < sw and comp_small[ny, nx] == 0 and not outside[ny, nx]:
-                outside[ny, nx] = True
-                q_bg.append((ny, nx))
-
-    filled_small = (~outside).astype(np.uint8) * 255
-    upscaled = Image.fromarray(filled_small, mode="L").resize((w, h), Image.Resampling.BILINEAR)
-    return (np.array(upscaled, dtype=np.uint8) > 127), True
-
-
-def _encode_jpeg_data_url(image: Image.Image, max_width: int = 380, quality: int = 80) -> str:
+def _encode_jpeg_data_url(image: Image.Image, max_width: int = 420, quality: int = 84) -> str:
     """Encodes a PIL Image as a compact JPEG data URL for fast mobile transfer."""
     img = image.convert("RGB")
     if img.width > max_width:
@@ -158,213 +65,312 @@ def _normalize_lighting_and_dull_razor(rgb: np.ndarray) -> np.ndarray:
     means = np.mean(arr, axis=(0, 1))
     means = np.maximum(means, 1.0)
     gray_target = float(np.mean(means))
-    scales = np.clip(gray_target / means, 0.78, 1.28)
+    scales = np.clip(gray_target / means, 0.80, 1.25)
     balanced = np.clip(arr * scales[None, None, :], 0.0, 255.0)
-    constancy = 0.55 * arr + 0.45 * balanced
+    constancy = 0.60 * arr + 0.40 * balanced
 
-    # Dull Razor morphological black-hat on luminance for stray hairs & specular glare
     lum = 0.299 * constancy[:, :, 0] + 0.587 * constancy[:, :, 1] + 0.114 * constancy[:, :, 2]
     closed_lum = _grey_closing_2d(lum, size=5)
     hair_response = closed_lum - lum
 
     sat = (np.max(constancy, axis=2) - np.min(constancy, axis=2)) / (np.max(constancy, axis=2) + 1e-5)
-    artifact_mask = (hair_response > 15.0) | ((lum > 240.0) & (sat < 0.14))
+    artifact_mask = (hair_response > 15.0) | ((lum > 242.0) & (sat < 0.12))
     artifact_weight = _gaussian_blur_2d(artifact_mask.astype(np.float32), sigma=1.1)
-    artifact_weight = np.clip(artifact_weight * 1.35, 0.0, 0.85)[:, :, None]
+    artifact_weight = np.clip(artifact_weight * 1.3, 0.0, 0.80)[:, :, None]
 
-    smoothed = _gaussian_blur_rgb(constancy, sigma=1.5)
+    smoothed = _gaussian_blur_rgb(constancy, sigma=1.4)
     cleaned = constancy * (1.0 - artifact_weight) + smoothed * artifact_weight
     return np.clip(cleaned, 0.0, 255.0)
 
 
-def _segment_skin_ycbcr_hsv(rgb: np.ndarray) -> np.ndarray:
+def _compute_skin_probability(rgb: np.ndarray) -> np.ndarray:
     """
-    Segments human facial skin pixels across all Fitzpatrick phototypes
-    using BT.601 YCbCr bounds paired with warm chromatic dominance.
+    Computes continuous [0..1] soft skin probability in YCbCr + warm RGB space
+    across all Fitzpatrick skin tones without harsh binary dropouts.
     """
     r = rgb[:, :, 0]
     g = rgb[:, :, 1]
     b = rgb[:, :, 2]
 
-    y_lum = 0.299 * r + 0.587 * g + 0.114 * b
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
     cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
     cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
 
-    ycbcr_skin = (cb >= 76.0) & (cb <= 126.0) & (cr >= 134.0) & (cr <= 174.0) & (y_lum > 35.0)
-    deep_tone_skin = (
-        (r > g * 1.05)
-        & (r > b * 1.14)
-        & ((r - np.minimum(g, b)) > 14.0)
-        & (cr >= 134.0)
-        & (cr <= 178.0)
-        & (cb >= 74.0)
-        & (cb <= 126.0)
-        & (y_lum > 28.0)
-    )
-    mask = ycbcr_skin | deep_tone_skin
-    return _morph_clean_mask(mask)
+    # Gaussian-shaped YCbCr skin likelihood centered on human skin locus
+    cr_score = np.exp(-0.5 * ((cr - 149.0) / 14.0) ** 2)
+    cb_score = np.exp(-0.5 * ((cb - 106.0) / 15.0) ** 2)
+    warm_score = np.clip((r - b + 8.0) / 36.0, 0.0, 1.0)
+    lum_ok = np.clip((lum - 24.0) / 28.0, 0.0, 1.0)
+
+    prob = cr_score * cb_score * (0.45 + 0.55 * warm_score) * lum_ok
+    return _gaussian_blur_2d(prob, sigma=2.5)
 
 
-def _smooth_1d(arr: np.ndarray) -> np.ndarray:
-    """Lightweight 1D box/binomial smoother replacing gaussian_filter on 1D strips."""
-    if arr.size < 3:
-        return arr
-    kernel = np.array([0.2, 0.6, 0.2], dtype=np.float32)
-    return np.convolve(arr.astype(np.float32), kernel, mode="same")
+def _sample_patch(arr: np.ndarray, cy: int, cx: int, ry: int, rx: int) -> float:
+    h, w = arr.shape
+    y0 = max(0, cy - ry)
+    y1 = min(h, cy + ry + 1)
+    x0 = max(0, cx - rx)
+    x1 = min(w, cx + rx + 1)
+    if y1 <= y0 or x1 <= x0:
+        return 0.0
+    return float(np.mean(arr[y0:y1, x0:x1]))
 
 
-def _detect_face_geometry(rgb: np.ndarray, skin_mask: np.ndarray) -> Dict[str, Any]:
+def _detect_face_geometry(rgb: np.ndarray, skin_prob: np.ndarray) -> Dict[str, Any]:
     """
-    Automatically localizes the user's face bounding box and fits anatomical
-    facial geometry (brow/eye line, nose bridge, cheek contours, mouth, chin)
-    purely via NumPy + Pillow.
+    Hybrid Viola-Jones Haar-like Eye-Pair + YCbCr Skin-Core face localization.
+    Locks strictly onto the eyes, nasal bridge, cheeks, mouth, and jaw without
+    drifting onto warm background walls or shoulders/clothing.
     """
     h, w, _ = rgb.shape
-    best_mask, detected = _largest_component_and_fill_holes(skin_mask)
-
-    if not detected:
-        x0, x1 = int(w * 0.24), int(w * 0.76)
-        y0, y1 = int(h * 0.14), int(h * 0.80)
-        center_x = 0.50
-    else:
-        ys, xs = np.where(best_mask)
-        y0 = int(np.percentile(ys, 2))
-        y1_raw = int(np.percentile(ys, 98))
-        x0 = int(np.percentile(xs, 3))
-        x1 = int(np.percentile(xs, 97))
-
-        box_w = max(20, x1 - x0)
-        max_face_h = int(box_w * 1.42)
-        if (y1_raw - y0) > max_face_h:
-            scan_start = y0 + int(max_face_h * 0.78)
-            scan_end = min(y1_raw, y0 + int(max_face_h * 1.15))
-            if scan_end > scan_start:
-                row_widths = np.sum(best_mask[scan_start:scan_end, x0:x1], axis=1)
-                mid_cheek_slice = best_mask[y0 + int(max_face_h * 0.35):scan_start, x0:x1]
-                mid_cheek_w = (
-                    float(np.percentile(np.sum(mid_cheek_slice, axis=1), 75))
-                    if mid_cheek_slice.size > 0
-                    else float(box_w * 0.7)
-                )
-                narrow_rows = np.where(row_widths < max(12.0, mid_cheek_w * 0.56))[0]
-                y1 = (scan_start + int(narrow_rows[0])) if len(narrow_rows) > 0 else (y0 + max_face_h)
-            else:
-                y1 = y0 + max_face_h
-        else:
-            y1 = y1_raw
-
-        upper_cut = y0 + max(10, int((y1 - y0) * 0.72))
-        _, upper_xs = np.where(best_mask[y0:upper_cut, x0:x1])
-        center_x = ((x0 + float(np.mean(upper_xs))) / float(w)) if len(upper_xs) > 0 else (((x0 + x1) * 0.5) / float(w))
-
-    bx = _clamp(x0 / float(w), 0.05, 0.70)
-    by = _clamp(y0 / float(h), 0.04, 0.70)
-    bw = _clamp((x1 - x0) / float(w), 0.24, 0.88)
-    bh = _clamp((y1 - y0) / float(h), 0.30, 0.88)
-    center_x = _clamp(center_x, bx + bw * 0.25, bx + bw * 0.75)
-
     lum = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
     cr = 128.0 + 0.5 * rgb[:, :, 0] - 0.418688 * rgb[:, :, 1] - 0.081312 * rgb[:, :, 2]
 
-    eye_band_top = int(h * (by + bh * 0.24))
-    eye_band_bot = int(h * (by + bh * 0.48))
-    mid_x0 = max(0, int(w * (center_x - bw * 0.28)))
-    mid_x1 = min(w, int(w * (center_x + bw * 0.28)))
+    # Work on compact grid (~120px wide) for ultra-fast multi-scale eye-pair search
+    scale = 120.0 / float(max(w, 1))
+    sw = max(48, int(round(w * scale)))
+    sh = max(48, int(round(h * scale)))
 
-    eye_y_rel = 0.36
-    left_eye_x = _clamp(center_x - bw * 0.19, bx + bw * 0.14, center_x - bw * 0.08)
-    right_eye_x = _clamp(center_x + bw * 0.19, center_x + bw * 0.08, bx + bw * 0.86)
-    left_eye_y = by + bh * eye_y_rel
-    right_eye_y = by + bh * eye_y_rel
+    lum_s = np.array(
+        Image.fromarray(np.clip(lum, 0, 255).astype(np.uint8), mode="L").resize((sw, sh), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    )
+    skin_s = np.array(
+        Image.fromarray(np.clip(skin_prob * 255.0, 0, 255).astype(np.uint8), mode="L").resize((sw, sh), Image.Resampling.BILINEAR),
+        dtype=np.float32,
+    ) / 255.0
 
-    if detected and eye_band_bot > eye_band_top + 4 and mid_x1 > mid_x0 + 8:
-        eye_prof = _smooth_1d(np.mean(lum[eye_band_top:eye_band_bot, mid_x0:mid_x1], axis=1))
-        eye_px_y = eye_band_top + int(np.argmin(eye_prof))
+    # Integral images for O(1) rectangular mean lookups
+    ii_lum = np.pad(lum_s, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    ii_skin = np.pad(skin_s, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
 
-        row_lo = max(0, eye_px_y - max(3, int(h * 0.025)))
-        row_hi = min(h, eye_px_y + max(3, int(h * 0.025)))
-        cx_px = int(w * center_x)
+    def box_mean(ii: np.ndarray, y0: int, y1: int, x0: int, x1: int) -> float:
+        y0c = max(0, min(sh - 1, y0))
+        y1c = max(y0c + 1, min(sh, y1))
+        x0c = max(0, min(sw - 1, x0))
+        x1c = max(x0c + 1, min(sw, x1))
+        area = float((y1c - y0c) * (x1c - x0c))
+        total = ii[y1c, x1c] - ii[y0c, x1c] - ii[y1c, x0c] + ii[y0c, x0c]
+        return float(total / area)
 
-        orbit_half = min(bw * 0.27, 0.22)
-        l_start = max(0, int(w * (center_x - orbit_half)))
-        l_end = max(l_start + 4, cx_px - max(4, int(w * bw * 0.06)))
-        if l_end > l_start:
-            l_strip = _smooth_1d(np.mean(lum[row_lo:row_hi, l_start:l_end], axis=0))
-            left_eye_x = (l_start + int(np.argmin(l_strip))) / float(w)
-            l_col = int(left_eye_x * w)
-            l_vstrip = lum[eye_band_top:eye_band_bot, max(0, l_col - 3):min(w, l_col + 4)]
-            if l_vstrip.size > 0:
-                left_eye_y = (eye_band_top + int(np.argmin(np.mean(l_vstrip, axis=1)))) / float(h)
+    best_score = -1e9
+    best_cfg = None
 
-        r_start = min(w - 4, cx_px + max(4, int(w * bw * 0.06)))
-        r_end = min(w, int(w * (center_x + orbit_half)))
-        if r_end > r_start:
-            r_strip = _smooth_1d(np.mean(lum[row_lo:row_hi, r_start:r_end], axis=0))
-            right_eye_x = (r_start + int(np.argmin(r_strip))) / float(w)
-            r_col = int(right_eye_x * w)
-            r_vstrip = lum[eye_band_top:eye_band_bot, max(0, r_col - 3):min(w, r_col + 4)]
-            if r_vstrip.size > 0:
-                right_eye_y = (eye_band_top + int(np.argmin(np.mean(r_vstrip, axis=1)))) / float(h)
+    # Search eye line (20%..56% height), center X (24%..76% width), half-IPD (11.5%..18.5% width)
+    for half_ipd_norm in (0.115, 0.138, 0.162, 0.185):
+        d = max(5, int(round(half_ipd_norm * sw)))
+        er_y = max(2, int(round(d * 0.28)))
+        er_x = max(2, int(round(d * 0.34)))
 
-    eye_y_norm = _clamp((left_eye_y + right_eye_y) * 0.5, by + bh * 0.26, by + bh * 0.46)
+        cy_min = max(int(sh * 0.18), int(d * 1.05))
+        cy_max = min(int(sh * 0.58), sh - int(d * 1.7))
+        cx_min = max(int(sw * 0.24), int(d * 1.25))
+        cx_max = min(int(sw * 0.76), sw - int(d * 1.25))
+
+        for ey in range(cy_min, max(cy_min + 1, cy_max), 2):
+            for cx in range(cx_min, max(cx_min + 1, cx_max), 2):
+                # Require BOTH eye regions + outer temples to sit inside facial skin, not dark hair/background
+                sk_fh = box_mean(ii_skin, ey - int(d * 0.92), ey - int(d * 0.34), cx - int(d * 0.7), cx + int(d * 0.7))
+                sk_eye_l = box_mean(ii_skin, ey - er_y, ey + int(d * 0.55), cx - d - int(d * 0.55), cx - d + int(d * 0.35))
+                sk_eye_r = box_mean(ii_skin, ey - er_y, ey + int(d * 0.55), cx + d - int(d * 0.35), cx + d + int(d * 0.55))
+                sk_ch = box_mean(ii_skin, ey + int(d * 0.35), ey + int(d * 1.05), cx - int(d * 0.95), cx + int(d * 0.95))
+                if sk_fh < 0.22 or sk_eye_l < 0.28 or sk_eye_r < 0.28 or sk_ch < 0.20:
+                    continue
+
+                lum_le = box_mean(ii_lum, ey - er_y, ey + er_y, cx - d - er_x, cx - d + er_x)
+                lum_re = box_mean(ii_lum, ey - er_y, ey + er_y, cx + d - er_x, cx + d + er_x)
+                if abs(lum_le - lum_re) > 42.0:
+                    continue
+
+                lum_bridge = box_mean(ii_lum, ey - er_y, ey + er_y + 1, cx - max(2, d // 4), cx + max(2, d // 4))
+                lum_fh = box_mean(ii_lum, ey - int(d * 1.0), ey - int(d * 0.42), cx - int(d * 0.65), cx + int(d * 0.65))
+                lum_cheek_l = box_mean(ii_lum, ey + int(d * 0.35), ey + int(d * 0.95), cx - d - er_x, cx - max(2, d // 3))
+                lum_cheek_r = box_mean(ii_lum, ey + int(d * 0.35), ey + int(d * 0.95), cx + max(2, d // 3), cx + d + er_x)
+
+                # Both eyes must individually be darker than their own cheek and nose bridge
+                left_c = min(lum_cheek_l - lum_le, lum_bridge - lum_le)
+                right_c = min(lum_cheek_r - lum_re, lum_bridge - lum_re)
+                if left_c <= 2.0 or right_c <= 2.0:
+                    continue
+
+                eye_dark_contrast = (
+                    min(left_c, right_c) * 1.45
+                    + (lum_fh - 0.5 * (lum_le + lum_re)) * 0.65
+                    + 0.5 * (left_c + right_c) * 0.55
+                )
+                symmetry_pen = abs(lum_le - lum_re) * 1.25
+                skin_conf = 0.35 + 0.45 * sk_fh + 0.45 * min(sk_eye_l, sk_eye_r)
+                prior = 1.0 - 0.16 * abs((cx / float(sw)) - 0.5)
+                score = (eye_dark_contrast - symmetry_pen) * skin_conf * prior
+
+                if score > best_score:
+                    best_score = score
+                    best_cfg = (cx / float(sw), ey / float(sh), (2.0 * d) / float(sw))
+
+    detected = best_cfg is not None and best_score > 6.0
+    if detected and best_cfg is not None:
+        center_x, eye_y_norm, ipd_w = best_cfg
+    else:
+        # Crisp centered fallback proportions
+        center_x = 0.50
+        eye_y_norm = 0.40
+        ipd_w = 0.25
+
+    # Convert horizontal IPD (normalized to image width) to vertical proportion using aspect ratio
+    ipd_px = ipd_w * float(w)
+    half_ipd_px = ipd_px * 0.5
+
+    # Refine individual left/right eye vertical centers within +-0.12*ipd_px
+    ey_px = int(round(eye_y_norm * h))
+    lx_px = int(round((center_x - ipd_w * 0.5) * w))
+    rx_px = int(round((center_x + ipd_w * 0.5) * w))
+    v_rad = max(4, int(round(ipd_px * 0.15)))
+    h_rad = max(3, int(round(ipd_px * 0.14)))
+
+    left_eye_y_px = ey_px
+    right_eye_y_px = ey_px
+    if detected:
+        l_y0, l_y1 = max(0, ey_px - v_rad), min(h, ey_px + v_rad)
+        l_x0, l_x1 = max(0, lx_px - h_rad // 2), min(w, lx_px + h_rad // 2)
+        l_win = lum[l_y0:l_y1, l_x0:l_x1]
+        if l_win.size > 0:
+            left_eye_y_px = l_y0 + int(np.argmin(np.mean(l_win, axis=1)))
+        r_y0, r_y1 = max(0, ey_px - v_rad), min(h, ey_px + v_rad)
+        r_x0, r_x1 = max(0, rx_px - h_rad // 2), min(w, rx_px + h_rad // 2)
+        r_win = lum[r_y0:r_y1, r_x0:r_x1]
+        if r_win.size > 0:
+            right_eye_y_px = r_y0 + int(np.argmin(np.mean(r_win, axis=1)))
+
+    left_eye_x = _clamp(lx_px / float(w), 0.08, 0.86)
+    right_eye_x = _clamp(rx_px / float(w), left_eye_x + 0.08, 0.92)
+    left_eye_y = _clamp(left_eye_y_px / float(h), 0.12, 0.72)
+    right_eye_y = _clamp(right_eye_y_px / float(h), 0.12, 0.72)
+    eye_y_norm = (left_eye_y + right_eye_y) * 0.5
+    eye_y_px = eye_y_norm * float(h)
+
     dy = (right_eye_y - left_eye_y) * h
-    dx = max(1e-3, (right_eye_x - left_eye_x) * w)
+    dx = max(1.0, (right_eye_x - left_eye_x) * w)
     tilt_deg = _clamp(math.degrees(math.atan2(dy, dx)), -14.0, 14.0)
 
-    mouth_y = by + bh * 0.74
-    m_top = int(h * (by + bh * 0.63))
-    m_bot = int(h * (by + bh * 0.86))
-    m_x0 = max(0, int(w * (center_x - bw * 0.18)))
-    m_x1 = min(w, int(w * (center_x + bw * 0.18)))
-    if detected and m_bot > m_top + 4 and m_x1 > m_x0 + 4:
-        lip_prof = _smooth_1d(np.mean(cr[m_top:m_bot, m_x0:m_x1], axis=1))
-        mouth_px_y = m_top + int(np.argmax(lip_prof))
-        mouth_y = _clamp(mouth_px_y / float(h), eye_y_norm + bh * 0.22, by + bh * 0.87)
+    # Estimate true face vertical/horizontal bounds around detected eye line
+    # Look outward laterally along cheek band & downward along chin axis for skin boundary
+    cx_px = int(round(center_x * w))
+    cheek_y0 = max(0, int(round(eye_y_px + 0.25 * ipd_px)))
+    cheek_y1 = min(h, int(round(eye_y_px + 1.10 * ipd_px)))
+    half_face_px = 1.25 * ipd_px
+    if detected and cheek_y1 > cheek_y0 + 4:
+        # Measure skin width across cheek strip around center_x
+        cheek_strip = np.mean(skin_prob[cheek_y0:cheek_y1, :], axis=0)
+        # Step outward left/right from cx_px up to max 2.0*ipd_px until skin prob drops
+        max_lat = min(int(round(2.0 * ipd_px)), w // 2)
+        l_span = int(round(1.1 * ipd_px))
+        for off in range(int(round(0.6 * ipd_px)), max_lat):
+            if cx_px - off <= 2 or cheek_strip[cx_px - off] < 0.18:
+                l_span = off
+                break
+            l_span = off
+        r_span = int(round(1.1 * ipd_px))
+        for off in range(int(round(0.6 * ipd_px)), max_lat):
+            if cx_px + off >= w - 3 or cheek_strip[cx_px + off] < 0.18:
+                r_span = off
+                break
+            r_span = off
+        measured_half = 0.5 * (l_span + r_span)
+        half_face_px = _clamp(measured_half, 1.04 * ipd_px, 1.38 * ipd_px)
 
-    nose_y = _clamp(eye_y_norm + (mouth_y - eye_y_norm) * 0.54, eye_y_norm + 0.04, mouth_y - 0.03)
-    nose_x = center_x
+    half_face_w = _clamp(half_face_px / float(w), 0.16, 0.36)
+
+    # Vertical canon tied to BOTH IPD & measured cheek width (oval head height ~ 2.45 * half_face_px)
+    eff_scale = max(ipd_px, half_face_px * 0.85)
+    y_top_px = max(4.0, eye_y_px - 0.92 * eff_scale)
+
+    # Probe chin tip below lower lip shadow up to neck fold (~1.68..2.02 * eff_scale)
+    chin_y_px = min(float(h - 6), eye_y_px + 1.88 * eff_scale)
+    if detected:
+        scan_lo = min(h - 10, int(round(eye_y_px + 1.62 * eff_scale)))
+        scan_hi = min(h - 4, int(round(eye_y_px + 2.08 * eff_scale)))
+        x_lo = max(0, int(round(cx_px - half_face_px * 0.30)))
+        x_hi = min(w, int(round(cx_px + half_face_px * 0.30)))
+        if scan_hi > scan_lo + 4 and x_hi > x_lo + 4:
+            # Find row with darkest jaw-under-chin shadow weighted away from upper lip band
+            chin_lum = np.mean(lum[scan_lo:scan_hi, x_lo:x_hi], axis=1)
+            chin_skin = np.mean(skin_prob[scan_lo:scan_hi, x_lo:x_hi], axis=1)
+            edge_score = (255.0 - chin_lum) * (0.6 + (1.0 - chin_skin))
+            chin_y_px = float(scan_lo + int(np.argmax(edge_score)))
+            chin_y_px = _clamp(
+                chin_y_px,
+                eye_y_px + 1.68 * eff_scale,
+                min(float(h - 6), eye_y_px + 2.02 * eff_scale),
+            )
+
+    nose_y_px = _clamp(eye_y_px + 0.62 * eff_scale, eye_y_px + 10.0, chin_y_px - 18.0)
+
+    # Refine mouth Y using Cr redness peak between nose tip and chin
+    m_search_y0 = max(int(eye_y_px + 0.88 * eff_scale), int(nose_y_px + 6))
+    m_search_y1 = min(int(chin_y_px - 10), int(eye_y_px + 1.38 * eff_scale))
+    m_x0 = max(0, int(cx_px - 0.35 * eff_scale))
+    m_x1 = min(w, int(cx_px + 0.35 * eff_scale))
+    mouth_y_px = eye_y_px + 1.15 * eff_scale
+    if detected and m_search_y1 > m_search_y0 + 3 and m_x1 > m_x0 + 3:
+        lip_strip = np.mean(cr[m_search_y0:m_search_y1, m_x0:m_x1], axis=1)
+        mouth_y_px = float(m_search_y0 + int(np.argmax(lip_strip)))
+    mouth_y_px = _clamp(mouth_y_px, nose_y_px + 0.22 * eff_scale, chin_y_px - 0.28 * eff_scale)
+    bx = _clamp(center_x - half_face_w, 0.04, 0.85)
+    bw = _clamp(half_face_w * 2.0, 0.24, 0.84)
+    by = _clamp(y_top_px / float(h), 0.03, 0.70)
+    bh = _clamp((chin_y_px - y_top_px) / float(h), 0.24, 0.84)
+
+    nose_y = _clamp(nose_y_px / float(h), eye_y_norm + 0.05, 0.85)
+    mouth_y = _clamp(mouth_y_px / float(h), nose_y + 0.04, 0.90)
+    chin_y = _clamp(chin_y_px / float(h), mouth_y + 0.04, 0.96)
+    forehead_top_y = by
+    face_h = max(0.20, chin_y - forehead_top_y)
 
     def pt(px: float, py: float) -> List[float]:
         return [round(_clamp(px, 0.02, 0.98), 4), round(_clamp(py, 0.02, 0.98), 4)]
 
+    # Tight anatomical face oval locked strictly to forehead, temples, cheekbones, jaw, and chin
     contour: List[List[float]] = [
-        pt(center_x, by + bh * 0.02),
-        pt(center_x + bw * 0.28, by + bh * 0.08),
-        pt(bx + bw * 0.96, eye_y_norm - bh * 0.04),
-        pt(bx + bw * 0.95, nose_y),
-        pt(bx + bw * 0.84, mouth_y + bh * 0.02),
-        pt(center_x + bw * 0.22, by + bh * 0.94),
-        pt(center_x, by + bh * 0.98),
-        pt(center_x - bw * 0.22, by + bh * 0.94),
-        pt(bx + bw * 0.16, mouth_y + bh * 0.02),
-        pt(bx + bw * 0.05, nose_y),
-        pt(bx + bw * 0.04, eye_y_norm - bh * 0.04),
-        pt(center_x - bw * 0.28, by + bh * 0.08),
+        pt(center_x, forehead_top_y),                                 # 0 Top forehead crown
+        pt(center_x + half_face_w * 0.62, forehead_top_y + face_h * 0.06),  # 1 Right forehead
+        pt(center_x + half_face_w * 0.96, eye_y_norm - face_h * 0.05),      # 2 Right temple
+        pt(center_x + half_face_w * 1.00, eye_y_norm + face_h * 0.16),      # 3 Right cheekbone
+        pt(center_x + half_face_w * 0.84, mouth_y - face_h * 0.02),         # 4 Right upper jaw
+        pt(center_x + half_face_w * 0.56, mouth_y + face_h * 0.15),         # 5 Right lower jaw
+        pt(center_x, chin_y),                                               # 6 Chin apex
+        pt(center_x - half_face_w * 0.56, mouth_y + face_h * 0.15),         # 7 Left lower jaw
+        pt(center_x - half_face_w * 0.84, mouth_y - face_h * 0.02),         # 8 Left upper jaw
+        pt(center_x - half_face_w * 1.00, eye_y_norm + face_h * 0.16),      # 9 Left cheekbone
+        pt(center_x - half_face_w * 0.96, eye_y_norm - face_h * 0.05),      # 10 Left temple
+        pt(center_x - half_face_w * 0.62, forehead_top_y + face_h * 0.06),  # 11 Left forehead
     ]
 
+    # T-Zone strictly spanning forehead + nasal bridge + tip
     t_zone: List[List[float]] = [
-        pt(center_x - bw * 0.26, by + bh * 0.13),
-        pt(center_x + bw * 0.26, by + bh * 0.13),
-        pt(center_x + bw * 0.23, eye_y_norm - bh * 0.06),
-        pt(center_x + bw * 0.08, eye_y_norm + bh * 0.02),
-        pt(center_x + bw * 0.11, nose_y + bh * 0.03),
-        pt(center_x, nose_y + bh * 0.06),
-        pt(center_x - bw * 0.11, nose_y + bh * 0.03),
-        pt(center_x - bw * 0.08, eye_y_norm + bh * 0.02),
-        pt(center_x - bw * 0.23, eye_y_norm - bh * 0.06),
+        pt(center_x - half_face_w * 0.58, forehead_top_y + face_h * 0.09),
+        pt(center_x + half_face_w * 0.58, forehead_top_y + face_h * 0.09),
+        pt(center_x + half_face_w * 0.52, eye_y_norm - face_h * 0.07),
+        pt(center_x + half_face_w * 0.16, eye_y_norm + face_h * 0.02),
+        pt(center_x + half_face_w * 0.22, nose_y + face_h * 0.03),
+        pt(center_x, nose_y + face_h * 0.06),
+        pt(center_x - half_face_w * 0.22, nose_y + face_h * 0.03),
+        pt(center_x - half_face_w * 0.16, eye_y_norm + face_h * 0.02),
+        pt(center_x - half_face_w * 0.52, eye_y_norm - face_h * 0.07),
     ]
 
+    # U-Zone cheeks strictly under the eyes, inside the cheek contour
     left_cheek_zone: List[List[float]] = [
-        pt(bx + bw * 0.11, eye_y_norm + bh * 0.08),
-        pt(center_x - bw * 0.15, eye_y_norm + bh * 0.09),
-        pt(center_x - bw * 0.15, mouth_y + bh * 0.04),
-        pt(bx + bw * 0.17, mouth_y + bh * 0.03),
+        pt(center_x - half_face_w * 0.86, eye_y_norm + face_h * 0.09),
+        pt(center_x - half_face_w * 0.28, eye_y_norm + face_h * 0.10),
+        pt(center_x - half_face_w * 0.26, mouth_y - face_h * 0.02),
+        pt(center_x - half_face_w * 0.74, mouth_y - face_h * 0.01),
     ]
     right_cheek_zone: List[List[float]] = [
-        pt(center_x + bw * 0.15, eye_y_norm + bh * 0.09),
-        pt(bx + bw * 0.89, eye_y_norm + bh * 0.08),
-        pt(bx + bw * 0.83, mouth_y + bh * 0.03),
-        pt(center_x + bw * 0.15, mouth_y + bh * 0.04),
+        pt(center_x + half_face_w * 0.28, eye_y_norm + face_h * 0.10),
+        pt(center_x + half_face_w * 0.86, eye_y_norm + face_h * 0.09),
+        pt(center_x + half_face_w * 0.74, mouth_y - face_h * 0.01),
+        pt(center_x + half_face_w * 0.26, mouth_y - face_h * 0.02),
     ]
 
     return {
@@ -377,14 +383,14 @@ def _detect_face_geometry(rgb: np.ndarray, skin_mask: np.ndarray) -> Dict[str, A
             "height": round(bh, 4),
         },
         "landmarks": {
-            "forehead": pt(center_x, by + bh * 0.17),
+            "forehead": pt(center_x, forehead_top_y + face_h * 0.17),
             "left_eye": pt(left_eye_x, left_eye_y),
             "right_eye": pt(right_eye_x, right_eye_y),
-            "nose_tip": pt(nose_x, nose_y),
-            "left_cheek": pt(center_x - bw * 0.26, nose_y + bh * 0.04),
-            "right_cheek": pt(center_x + bw * 0.26, nose_y + bh * 0.04),
+            "nose_tip": pt(center_x, nose_y),
+            "left_cheek": pt(center_x - half_face_w * 0.56, nose_y + face_h * 0.02),
+            "right_cheek": pt(center_x + half_face_w * 0.56, nose_y + face_h * 0.02),
             "mouth_center": pt(center_x, mouth_y),
-            "chin": pt(center_x, by + bh * 0.94),
+            "chin": pt(center_x, chin_y - face_h * 0.03),
         },
         "contour": contour,
         "t_zone": t_zone,
@@ -393,45 +399,63 @@ def _detect_face_geometry(rgb: np.ndarray, skin_mask: np.ndarray) -> Dict[str, A
     }
 
 
-def _generate_woodlamp_image(norm_rgb: np.ndarray, skin_mask: np.ndarray) -> Tuple[Image.Image, Dict[str, float]]:
+def _build_face_oval_mask(w: int, h: int, geom: Dict[str, Any], blur_sigma: float = 0.0) -> np.ndarray:
+    """Renders a crisp or soft-feathered float [0..1] facial mask inside geom['contour']."""
+    mask_img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask_img)
+    contour_px = [(int(round(p[0] * w)), int(round(p[1] * h))) for p in geom["contour"]]
+    draw.polygon(contour_px, fill=255)
+    if blur_sigma > 0:
+        mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=blur_sigma))
+    return np.array(mask_img, dtype=np.float32) / 255.0
+
+
+def _generate_woodlamp_image(norm_rgb: np.ndarray, geom: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, float]]:
     """
-    Simulates dermatological 365nm UV-A Wood's Lamp illumination from RGB face data.
+    Simulates continuous dermatological 365nm UV-A Wood's Lamp illumination
+    anchored cleanly to the fitted face contour:
+    - Smooth facial fluorescence without harsh binary blotches
+    - Deep cobalt-indigo ambient vignette outside the face
+    - Cyan-aqua sebum/pore fluorescence & melanin UV absorption contrast
     """
     r = norm_rgb[:, :, 0]
     g = norm_rgb[:, :, 1]
     b = norm_rgb[:, :, 2]
+    h, w = r.shape
 
     lum = 0.299 * r + 0.587 * g + 0.114 * b
     cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
 
-    skin_f = _gaussian_blur_2d(skin_mask.astype(np.float32), sigma=2.0)
-    bg_f = 1.0 - skin_f
+    face_soft = _build_face_oval_mask(w, h, geom, blur_sigma=max(6.0, w * 0.045))
+    face_bool = face_soft > 0.35
 
-    local_base = _gaussian_blur_2d(lum, sigma=7.0)
+    # Local subsurface texture & pore fluorescence under UV
+    local_base = _gaussian_blur_2d(lum, sigma=6.5)
     micro_scatter = lum - local_base
-    pore_dip = np.clip(-micro_scatter / 18.0, 0.0, 1.0)
-    sebum_glow = np.clip(micro_scatter / 16.0, 0.0, 1.0)
+    sebum_glow = np.clip(micro_scatter / 15.0, 0.0, 1.0)
+    melanin_abs = np.clip(1.0 - (lum / 225.0), 0.05, 0.88)
+    erythema_norm = np.clip((cr - 135.0) / 36.0, 0.0, 1.0)
 
-    melanin_abs = np.clip(1.0 - (lum / 220.0), 0.05, 0.90)
-    erythema_norm = np.clip((cr - 134.0) / 38.0, 0.0, 1.0)
+    # Normalized luminance preserved cleanly so facial features remain unmistakable
+    lum_n = np.clip(lum / 255.0, 0.0, 1.0)
 
-    bg_lum = lum * 0.22
-    w_r = (
-        skin_f * (12.0 + 28.0 * (1.0 - melanin_abs) + 92.0 * erythema_norm * (0.45 + 0.55 * pore_dip) + 46.0 * sebum_glow)
-        + bg_f * (8.0 + bg_lum * 0.25)
-    )
-    w_g = (
-        skin_f * (38.0 + 118.0 * (0.72 - 0.42 * melanin_abs) + 102.0 * sebum_glow)
-        + bg_f * (18.0 + bg_lum * 0.40)
-    )
-    w_b = (
-        skin_f * (108.0 + 136.0 * (0.88 - 0.30 * melanin_abs) + 52.0 * sebum_glow)
-        + bg_f * (52.0 + bg_lum * 0.72)
-    )
+    # Inside face: true clinical Wood's UV cobalt + cyan sebum glow
+    face_r = 16.0 + 36.0 * lum_n + 42.0 * sebum_glow + 38.0 * erythema_norm * lum_n
+    face_g = 48.0 + 112.0 * lum_n + 78.0 * sebum_glow
+    face_b = 126.0 + 122.0 * lum_n + 36.0 * sebum_glow
+
+    # Outside face: muted dark UV examination room blue
+    room_r = 10.0 + 18.0 * lum_n
+    room_g = 22.0 + 42.0 * lum_n
+    room_b = 58.0 + 88.0 * lum_n
+
+    w_r = face_soft * face_r + (1.0 - face_soft) * room_r
+    w_g = face_soft * face_g + (1.0 - face_soft) * room_g
+    w_b = face_soft * face_b + (1.0 - face_soft) * room_b
 
     wood_arr = np.clip(np.stack([w_r, w_g, w_b], axis=2), 0.0, 255.0).astype(np.uint8)
 
-    valid = skin_mask if np.any(skin_mask) else np.ones(lum.shape, dtype=bool)
+    valid = face_bool if np.any(face_bool) else np.ones(lum.shape, dtype=bool)
     sebum_idx = float(np.clip(np.mean(sebum_glow[valid]) * 185.0 + 18.0, 5.0, 96.0))
     erythema_idx = float(np.clip(np.mean(erythema_norm[valid]) * 145.0, 5.0, 96.0))
     melanin_contrast = float(np.clip(np.std(melanin_abs[valid]) * 310.0, 8.0, 95.0))
@@ -448,12 +472,12 @@ def _generate_woodlamp_image(norm_rgb: np.ndarray, skin_mask: np.ndarray) -> Tup
 
 def _generate_geometry_mesh_image(norm_rgb: np.ndarray, geom: Dict[str, Any]) -> Image.Image:
     """
-    Renders clean Blue & White clinical anatomical wireframe, T-Zone / U-Zone boundaries,
-    and fitted facial landmarks directly onto the user's face proportions.
+    Renders a crisp, dense clinical Blue & White anatomical wireframe fitted directly
+    to the detected eyes, nose, cheeks, jawline, and T/U-zones.
     """
     arr = norm_rgb.astype(np.float32)
     lum = (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2])[:, :, None]
-    cool_tint = 0.62 * arr + 0.38 * (lum * np.array([[[0.88, 0.94, 1.04]]], dtype=np.float32))
+    cool_tint = 0.70 * arr + 0.30 * (lum * np.array([[[0.90, 0.95, 1.03]]], dtype=np.float32))
     base = Image.fromarray(np.clip(cool_tint, 0, 255).astype(np.uint8), mode="RGB").convert("RGBA")
 
     w, h = base.size
@@ -463,21 +487,18 @@ def _generate_geometry_mesh_image(norm_rgb: np.ndarray, geom: Dict[str, Any]) ->
     def to_px(pt: List[float]) -> Tuple[int, int]:
         return (int(round(pt[0] * w)), int(round(pt[1] * h)))
 
-    contour_px = [to_px(p) for p in geom["contour"]]
+    def mid(a: Tuple[int, int], b: Tuple[int, int], t: float = 0.5) -> Tuple[int, int]:
+        return (int(round(a[0] * (1.0 - t) + b[0] * t)), int(round(a[1] * (1.0 - t) + b[1] * t)))
+
+    c_px = [to_px(p) for p in geom["contour"]]
     tzone_px = [to_px(p) for p in geom["t_zone"]]
     lcheek_px = [to_px(p) for p in geom["left_cheek_zone"]]
     rcheek_px = [to_px(p) for p in geom["right_cheek_zone"]]
 
-    draw.polygon(tzone_px, fill=(30, 108, 239, 44), outline=(37, 99, 235, 220))
-    draw.polygon(lcheek_px, fill=(14, 165, 233, 38), outline=(56, 189, 248, 210))
-    draw.polygon(rcheek_px, fill=(14, 165, 233, 38), outline=(56, 189, 248, 210))
-
-    line_w = max(2, int(round(min(w, h) * 0.006)))
-    draw.polygon(contour_px, outline=(255, 255, 255, 215))
-    for i in range(len(contour_px)):
-        p1 = contour_px[i]
-        p2 = contour_px[(i + 1) % len(contour_px)]
-        draw.line([p1, p2], fill=(30, 108, 239, 230), width=line_w)
+    # Clean soft blue zone tints
+    draw.polygon(tzone_px, fill=(30, 108, 239, 36), outline=(37, 99, 235, 210))
+    draw.polygon(lcheek_px, fill=(14, 165, 233, 32), outline=(56, 189, 248, 200))
+    draw.polygon(rcheek_px, fill=(14, 165, 233, 32), outline=(56, 189, 248, 200))
 
     lm = geom["landmarks"]
     fh = to_px(lm["forehead"])
@@ -489,25 +510,49 @@ def _generate_geometry_mesh_image(norm_rgb: np.ndarray, geom: Dict[str, Any]) ->
     mc = to_px(lm["mouth_center"])
     ch = to_px(lm["chin"])
 
+    # Additional anatomical anchor midpoints (glabella, nose bridge, mouth corners)
+    glab = mid(le, re, 0.5)
+    n_bridge = mid(glab, nt, 0.5)
+    l_lip = mid(mc, c_px[8], 0.36)
+    r_lip = mid(mc, c_px[4], 0.36)
+    l_brow = mid(le, c_px[11], 0.42)
+    r_brow = mid(re, c_px[1], 0.42)
+
     mesh_edges = [
-        (fh, le), (fh, re), (fh, nt),
-        (le, re), (le, nt), (re, nt),
-        (le, lc), (re, rc), (lc, nt), (rc, nt),
-        (lc, mc), (rc, mc), (nt, mc),
-        (lc, ch), (rc, ch), (mc, ch),
-        (contour_px[11], fh), (contour_px[1], fh),
-        (contour_px[10], le), (contour_px[2], re),
-        (contour_px[9], lc), (contour_px[3], rc),
-        (contour_px[8], mc), (contour_px[4], mc),
-        (contour_px[7], ch), (contour_px[5], ch),
+        # Upper cranium / brow arch
+        (c_px[11], fh), (fh, c_px[1]),
+        (c_px[10], l_brow), (l_brow, fh), (fh, r_brow), (r_brow, c_px[2]),
+        (l_brow, glab), (r_brow, glab), (fh, glab),
+        # Orbital & nasal bridge
+        (c_px[10], le), (l_brow, le), (le, glab),
+        (c_px[2], re), (r_brow, re), (re, glab),
+        (glab, n_bridge), (n_bridge, nt), (le, n_bridge), (re, n_bridge),
+        # Midface cheekbones & nasolabial
+        (c_px[9], lc), (le, lc), (n_bridge, lc), (nt, lc),
+        (c_px[3], rc), (re, rc), (n_bridge, rc), (nt, rc),
+        # Perioral & jawline
+        (nt, l_lip), (nt, r_lip), (nt, mc),
+        (lc, l_lip), (rc, r_lip), (l_lip, mc), (r_lip, mc),
+        (c_px[8], l_lip), (c_px[4], r_lip),
+        (c_px[8], mc), (c_px[4], mc),
+        (l_lip, c_px[7]), (r_lip, c_px[5]), (mc, ch),
+        (c_px[7], ch), (c_px[5], ch), (lc, c_px[8]), (rc, c_px[4]),
     ]
-    thin_w = max(1, line_w - 1)
+
+    thin_w = max(1, int(round(min(w, h) * 0.004)))
     for a, b in mesh_edges:
-        draw.line([a, b], fill=(191, 219, 254, 185), width=thin_w)
+        draw.line([a, b], fill=(219, 234, 254, 195), width=thin_w)
+
+    # Outer fitted contour in crisp AURA Blue
+    line_w = max(2, int(round(min(w, h) * 0.006)))
+    for i in range(len(c_px)):
+        p1 = c_px[i]
+        p2 = c_px[(i + 1) % len(c_px)]
+        draw.line([p1, p2], fill=(30, 108, 239, 235), width=line_w)
 
     r_outer = max(3, int(round(min(w, h) * 0.011)))
     r_inner = max(2, r_outer - 1)
-    for key_pt in [fh, le, re, nt, lc, rc, mc, ch]:
+    for key_pt in [fh, le, re, glab, nt, lc, rc, mc, ch]:
         draw.ellipse(
             [key_pt[0] - r_outer, key_pt[1] - r_outer, key_pt[0] + r_outer, key_pt[1] + r_outer],
             fill=(255, 255, 255, 245),
@@ -523,11 +568,11 @@ def _generate_geometry_mesh_image(norm_rgb: np.ndarray, geom: Dict[str, Any]) ->
 
 
 def _generate_micro_analysis_image(
-    norm_rgb: np.ndarray, skin_mask: np.ndarray, geom: Dict[str, Any]
+    norm_rgb: np.ndarray, skin_prob: np.ndarray, geom: Dict[str, Any]
 ) -> Image.Image:
     """
-    Computes a spatial ~384 micro-patch skin biomarker map masked tightly inside
-    the detected face contour.
+    Computes a clean, subtle ~384 micro-patch skin biomarker map clipped strictly
+    inside the fitted facial contour while keeping the face clearly visible underneath.
     """
     r = norm_rgb[:, :, 0]
     g = norm_rgb[:, :, 1]
@@ -535,8 +580,13 @@ def _generate_micro_analysis_image(
     lum = 0.299 * r + 0.587 * g + 0.114 * b
     cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
 
-    gray_base = np.stack([lum * 0.92, lum * 0.95, lum * 1.02], axis=2)
-    base_rgba = Image.fromarray(np.clip(gray_base, 0, 255).astype(np.uint8), mode="RGB").convert("RGBA")
+    # Keep portrait crisp with subtle cool clinical tone
+    cool_base = np.stack([
+        0.55 * r + 0.45 * lum * 0.94,
+        0.55 * g + 0.45 * lum * 0.97,
+        0.55 * b + 0.45 * lum * 1.03,
+    ], axis=2)
+    base_rgba = Image.fromarray(np.clip(cool_base, 0, 255).astype(np.uint8), mode="RGB").convert("RGBA")
     w, h = base_rgba.size
 
     face_poly = Image.new("L", (w, h), 0)
@@ -545,59 +595,84 @@ def _generate_micro_analysis_image(
     poly_draw.polygon(contour_px, fill=255)
     face_arr = np.array(face_poly) > 128
 
+    # Keep eye bands gentle so eyes remain natural and clear
+    lm = geom["landmarks"]
+    ley_y = int(round(lm["left_eye"][1] * h))
+    rey_y = int(round(lm["right_eye"][1] * h))
+    eye_half_r = max(6, int(round(geom["bbox"]["width"] * w * 0.10)))
+
     overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     bbox = geom["bbox"]
-    fx0 = int(bbox["x"] * w)
-    fy0 = int(bbox["y"] * h)
-    fx1 = int((bbox["x"] + bbox["width"]) * w)
-    fy1 = int((bbox["y"] + bbox["height"]) * h)
+    fx0 = max(0, min(w - 2, int(bbox["x"] * w)))
+    fy0 = max(0, min(h - 2, int(bbox["y"] * h)))
+    fx1 = max(fx0 + 1, min(w, int((bbox["x"] + bbox["width"]) * w)))
+    fy1 = max(fy0 + 1, min(h, int((bbox["y"] + bbox["height"]) * h)))
 
     cols, rows = 18, 22
     cell_w = max(4.0, (fx1 - fx0) / float(cols))
     cell_h = max(4.0, (fy1 - fy0) / float(rows))
 
-    face_cr = cr[fy0:max(fy0 + 1, fy1), fx0:max(fx0 + 1, fx1)]
+    face_cr = cr[fy0:fy1, fx0:fx1]
     baseline_cr = float(np.median(face_cr)) if face_cr.size > 0 else 140.0
 
     for row in range(rows):
         for col in range(cols):
-            cx0 = int(round(fx0 + col * cell_w))
-            cy0 = int(round(fy0 + row * cell_h))
-            cx1 = int(round(fx0 + (col + 1) * cell_w))
-            cy1 = int(round(fy0 + (row + 1) * cell_h))
+            cx0 = max(0, min(w - 1, int(round(fx0 + col * cell_w))))
+            cy0 = max(0, min(h - 1, int(round(fy0 + row * cell_h))))
+            cx1 = max(cx0, min(w, int(round(fx0 + (col + 1) * cell_w))))
+            cy1 = max(cy0, min(h, int(round(fy0 + (row + 1) * cell_h))))
             if cx1 <= cx0 or cy1 <= cy0:
                 continue
 
             patch_mask = face_arr[cy0:cy1, cx0:cx1]
-            if np.mean(patch_mask) < 0.45:
+            if patch_mask.size == 0 or np.mean(patch_mask) < 0.55:
                 continue
+
+            # Subtle transparency inside orbital region so pupils remain crisp
+            pm_x = (cx0 + cx1) * 0.5
+            pm_y = (cy0 + cy1) * 0.5
+            near_eye = (
+                math.hypot(pm_x - lm["left_eye"][0] * w, pm_y - ley_y) < eye_half_r
+                or math.hypot(pm_x - lm["right_eye"][0] * w, pm_y - rey_y) < eye_half_r
+            )
+            alpha_scale = 0.38 if near_eye else 1.0
 
             patch_cr = float(np.mean(cr[cy0:cy1, cx0:cx1]))
             patch_std = float(np.std(lum[cy0:cy1, cx0:cx1]))
             stress = _clamp(((patch_cr - baseline_cr) / 14.0) * 0.65 + (patch_std / 24.0) * 0.35, 0.0, 1.0)
 
-            if stress < 0.35:
-                fill_col = (30, 108, 239, 95)
-            elif stress < 0.62:
-                fill_col = (14, 165, 233, 105)
-            elif stress < 0.80:
-                fill_col = (245, 158, 11, 118)
+            if stress < 0.38:
+                fill_col = (30, 108, 239, int(52 * alpha_scale))
+            elif stress < 0.64:
+                fill_col = (14, 165, 233, int(64 * alpha_scale))
+            elif stress < 0.82:
+                fill_col = (245, 158, 11, int(76 * alpha_scale))
             else:
-                fill_col = (239, 68, 68, 128)
+                fill_col = (239, 68, 68, int(86 * alpha_scale))
 
-            draw.rectangle([cx0, cy0, cx1 - 1, cy1 - 1], fill=fill_col, outline=(255, 255, 255, 70))
+            draw.rectangle([cx0, cy0, cx1 - 1, cy1 - 1], fill=fill_col, outline=(255, 255, 255, int(48 * alpha_scale)))
+
+    # Subtle outer face boundary ring
+    for i in range(len(contour_px)):
+        p1 = contour_px[i]
+        p2 = contour_px[(i + 1) % len(contour_px)]
+        draw.line([p1, p2], fill=(255, 255, 255, 165), width=max(1, int(round(w * 0.004))))
 
     return Image.alpha_composite(base_rgba, overlay).convert("RGB")
 
 
 def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
     """
-    Executes the full Python Computer Vision skin pipeline in pure NumPy + Pillow
-    (no SciPy shared-library overhead on serverless cold start).
+    Executes the full Python Computer Vision skin pipeline in pure NumPy + Pillow:
+      1. EXIF transpose correction so mobile selfies align upright
+      2. Lighting constancy & Dull Razor artifact suppression
+      3. YCbCr skin probability + Haar-like eye-pair facial geometry fitting
+      4. Smooth Wood's Lamp 365nm simulation, anatomical mesh & 384+ micro-patch map
     """
     pil_img = Image.open(io.BytesIO(image_bytes))
+    pil_img = ImageOps.exif_transpose(pil_img)
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
 
@@ -607,14 +682,17 @@ def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
     rgb = np.array(work_img, dtype=np.uint8)
 
     norm_rgb = _normalize_lighting_and_dull_razor(rgb)
-    skin_mask = _segment_skin_ycbcr_hsv(norm_rgb)
-    geom = _detect_face_geometry(norm_rgb, skin_mask)
+    skin_prob = _compute_skin_probability(norm_rgb)
+    geom = _detect_face_geometry(norm_rgb, skin_prob)
 
-    wood_img, wood_metrics = _generate_woodlamp_image(norm_rgb, skin_mask)
+    wood_img, wood_metrics = _generate_woodlamp_image(norm_rgb, geom)
     mesh_img = _generate_geometry_mesh_image(norm_rgb, geom)
-    micro_img = _generate_micro_analysis_image(norm_rgb, skin_mask, geom)
+    micro_img = _generate_micro_analysis_image(norm_rgb, skin_prob, geom)
 
-    skin_cov_pct = round(float(np.mean(skin_mask) * 100.0), 1)
+    face_mask = _build_face_oval_mask(work_img.width, work_img.height, geom) > 0.5
+    skin_cov_pct = round(float(np.mean((skin_prob > 0.25) & face_mask) * 100.0 / max(0.05, float(np.mean(face_mask)))), 1)
+    skin_cov_pct = min(100.0, skin_cov_pct)
+
     cv_metrics = {
         **wood_metrics,
         "skin_coverage_pct": skin_cov_pct,
@@ -638,9 +716,9 @@ def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
 
     return {
         "face_geometry": geom,
-        "woodlamp_image": _encode_jpeg_data_url(wood_img, max_width=380, quality=80),
-        "geometry_mesh_image": _encode_jpeg_data_url(mesh_img, max_width=380, quality=82),
-        "micro_analysis_image": _encode_jpeg_data_url(micro_img, max_width=380, quality=82),
+        "woodlamp_image": _encode_jpeg_data_url(wood_img, max_width=420, quality=84),
+        "geometry_mesh_image": _encode_jpeg_data_url(mesh_img, max_width=420, quality=85),
+        "micro_analysis_image": _encode_jpeg_data_url(micro_img, max_width=420, quality=85),
         "cv_metrics": cv_metrics,
         "woods_lamp_findings": findings,
     }

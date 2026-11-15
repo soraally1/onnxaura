@@ -5,7 +5,7 @@ import json
 import base64
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageOps
 from groq import AsyncGroq
 
 try:
@@ -118,6 +118,7 @@ def prepare_image_base64(image_bytes: bytes, max_size: int = 1024) -> str:
     Returns base64 data URL string.
     """
     image = Image.open(io.BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image)
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
     
