@@ -13,18 +13,18 @@ try:
 except Exception:
     pass
 
-# Configure environment directories for serverless environments (e.g. Vercel)
+# Configure environment directories & thread caps for serverless environments (e.g. Vercel)
 os.environ['JOBLIB_TEMP_FOLDER'] = '/tmp'
 os.environ['NUMBA_CACHE_DIR'] = '/tmp'
 os.environ['MPLCONFIGDIR'] = '/tmp'
 os.environ['XDG_CACHE_HOME'] = '/tmp'
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
 
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
-import onnxruntime as ort
-import api.dsp as dsp
-from scipy.special import softmax
 
 from api.skin_analysis import analyze_skin_with_groq
 from api.scin_taxonomy import (
@@ -34,6 +34,28 @@ from api.scin_taxonomy import (
     SCIN_BODY_PARTS,
     ENVIRONMENTAL_SCIN_CONDITIONS,
 )
+
+# Lazy-loaded cough runtime (prevents librosa/llvmlite/onnxruntime cold-start failures on skin & health routes)
+_cough_session = None
+_dsp_module = None
+_softmax_fn = None
+
+
+def _get_cough_runtime():
+    global _cough_session, _dsp_module, _softmax_fn
+    if _cough_session is None:
+        import onnxruntime as ort
+        import api.dsp as dsp_mod
+        from scipy.special import softmax as scipy_softmax
+
+        icbhi_path = os.path.join(os.path.dirname(__file__), "best_icbhi_model.onnx")
+        if not os.path.exists(icbhi_path):
+            raise FileNotFoundError(f"Cough ONNX model not found at {icbhi_path}")
+
+        _cough_session = ort.InferenceSession(icbhi_path)
+        _dsp_module = dsp_mod
+        _softmax_fn = scipy_softmax
+    return _cough_session, _dsp_module, _softmax_fn
 
 app = FastAPI(
     title="AURA Health AI - Cough & Environmental Skin Analysis API",
@@ -81,15 +103,8 @@ COUGH_CLINICAL_MAPPING = {
     }
 }
 
-# --- LOAD COUGH MODEL ONLY ---
-print("Loading Cough ONNX Model (best_icbhi_model.onnx)...")
+# --- COUGH MODEL PATH CONFIGURATION ---
 icbhi_path = os.path.join(os.path.dirname(__file__), "best_icbhi_model.onnx")
-
-if not os.path.exists(icbhi_path):
-    raise FileNotFoundError(f"Cough ONNX model not found at {icbhi_path}")
-
-cough_session = ort.InferenceSession(icbhi_path)
-print("Cough ONNX Model loaded successfully.")
 
 
 # =====================================================================
@@ -102,8 +117,8 @@ def health_check():
         "status": "ok",
         "service": "AURA Health AI",
         "active_models": {
-            "cough_model": "best_icbhi_model.onnx (Loaded)",
-            "skin_model": "Groq AI (qwen/qwen3.8-27b) + Google SCIN Validation"
+            "cough_model": f"best_icbhi_model.onnx ({'Ready' if os.path.exists(icbhi_path) else 'Missing'})",
+            "skin_model": "Groq AI (qwen/qwen3.8-27b) + Wood's Lamp CV + Google SCIN"
         },
         "endpoints": {
             "cough_analysis": "POST /api/predict/cough",
@@ -129,6 +144,7 @@ async def process_cough_inference(
         raise HTTPException(status_code=400, detail="Only .wav audio files are supported for cough analysis.")
         
     try:
+        cough_session, dsp, softmax = _get_cough_runtime()
         audio_bytes = await file.read()
         mel_spec = dsp.process_audio(audio_bytes) 
         

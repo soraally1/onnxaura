@@ -40,7 +40,7 @@ from api.scin_taxonomy import (
 
 # User configured primary vision model: qwen/qwen3.8-27b
 GROQ_DEFAULT_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
-GROQ_FALLBACK_VISION_MODEL = "llama-3.2-11b-vision-preview"
+GROQ_FALLBACK_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 SCIN_SYSTEM_PROMPT = f"""
 Anda adalah dermatologis AI ahli spesialis Dermatologi Lingkungan (Environmental Dermatology) yang menggunakan standar validasi dataset Google SCIN (Skin Condition Image Network).

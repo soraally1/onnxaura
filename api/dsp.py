@@ -1,12 +1,11 @@
 import os
-import io
-import librosa
+import tempfile
 import numpy as np
-from scipy.signal import butter, lfilter
 
 TARGET_SR = 16000
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
+    from scipy.signal import butter
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
@@ -14,16 +13,16 @@ def butter_bandpass(lowcut, highcut, fs, order=5):
     return b, a
 
 def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    from scipy.signal import lfilter
     b, a = butter_bandpass(lowcut, highcut, fs, order=order)
     y = lfilter(b, a, data)
     return y
-
-import tempfile
 
 def load_and_resample(audio_bytes: bytes) -> np.ndarray:
     """
     Loads audio from bytes and resamples to 16 kHz Mono.
     """
+    import librosa
     with tempfile.NamedTemporaryFile(delete=False, suffix='.wav', dir='/tmp') as temp_audio:
         temp_audio.write(audio_bytes)
         temp_audio.flush()
@@ -47,6 +46,7 @@ def extract_mel_spectrogram(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
     """
     Extracts Mel-Spectrogram (n_mels=128, n_fft=2048, hop_length=512).
     """
+    import librosa
     S = librosa.feature.melspectrogram(
         y=y, 
         sr=sr, 
