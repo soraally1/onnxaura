@@ -157,16 +157,16 @@ def _detect_face_geometry(rgb: np.ndarray, skin_prob: np.ndarray) -> Dict[str, A
     best_score = -1e9
     best_cfg = None
 
-    # Search eye line (18%..64% height), center X (20%..80% width), half-IPD (9.5%..19% width)
-    for half_ipd_norm in (0.095, 0.115, 0.138, 0.162, 0.188):
+    # Search eye line (14%..64% height), center X (18%..82% width), half-IPD (9.5%..24.5% width)
+    for half_ipd_norm in (0.095, 0.118, 0.145, 0.175, 0.21, 0.245):
         d = max(5, int(round(half_ipd_norm * sw)))
         er_y = max(2, int(round(d * 0.28)))
         er_x = max(2, int(round(d * 0.34)))
 
-        cy_min = max(int(sh * 0.18), int(d * 1.00))
-        cy_max = min(int(sh * 0.64), sh - int(d * 1.45))
-        cx_min = max(int(sw * 0.20), int(d * 1.15))
-        cx_max = min(int(sw * 0.80), sw - int(d * 1.15))
+        cy_min = max(int(sh * 0.14), int(d * 0.75))
+        cy_max = min(int(sh * 0.64), sh - int(d * 1.25))
+        cx_min = max(int(sw * 0.18), int(d * 0.95))
+        cx_max = min(int(sw * 0.82), sw - int(d * 0.95))
 
         for ey in range(cy_min, max(cy_min + 1, cy_max), 2):
             for cx in range(cx_min, max(cx_min + 1, cx_max), 2):
@@ -678,12 +678,93 @@ def _generate_micro_analysis_image(
     return Image.alpha_composite(base_rgba, overlay).convert("RGB")
 
 
+def _crop_face_to_geometry(
+    pil_img: Image.Image, geom: Dict[str, Any]
+) -> Tuple[Image.Image, Dict[str, Any]]:
+    """
+    Crops image tightly to the fitted facial contour + subtle 6% margin so the
+    resulting portrait contains only the tracked face (no room/clothing clutter)
+    and re-normalizes all geometry coordinates into [0..1] of the cropped image.
+    """
+    contour = geom.get("contour") or []
+    if not contour or not geom.get("detected"):
+        return pil_img, geom
+
+    xs = [p[0] for p in contour]
+    ys = [p[1] for p in contour]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_w = max(0.20, max_x - min_x)
+    span_h = max(0.24, max_y - min_y)
+
+    # Skip re-crop if face already fills >78% width & >78% height
+    if span_w > 0.78 and span_h > 0.78:
+        return pil_img, geom
+
+    pad_x = span_w * 0.065
+    pad_y = span_h * 0.065
+    cx0 = _clamp(min_x - pad_x, 0.0, 0.85)
+    cy0 = _clamp(min_y - pad_y, 0.0, 0.85)
+    cx1 = _clamp(max_x + pad_x, cx0 + 0.15, 1.0)
+    cy1 = _clamp(max_y + pad_y, cy0 + 0.15, 1.0)
+
+    ow, oh = pil_img.size
+    px0 = max(0, int(round(cx0 * ow)))
+    py0 = max(0, int(round(cy0 * oh)))
+    px1 = min(ow, int(round(cx1 * ow)))
+    py1 = min(oh, int(round(cy1 * oh)))
+    if px1 - px0 < 32 or py1 - py0 < 32:
+        return pil_img, geom
+
+    cropped = pil_img.crop((px0, py0, px1, py1))
+    cw = max(1e-5, (px1 - px0) / float(ow))
+    ch = max(1e-5, (py1 - py0) / float(oh))
+    nx0 = px0 / float(ow)
+    ny0 = py0 / float(oh)
+
+    def remap(pt: List[float]) -> List[float]:
+        return [
+            round(_clamp((pt[0] - nx0) / cw, 0.01, 0.99), 4),
+            round(_clamp((pt[1] - ny0) / ch, 0.01, 0.99), 4),
+        ]
+
+    bb = geom["bbox"]
+    new_geom = {
+        "detected": geom["detected"],
+        "tilt_deg": geom["tilt_deg"],
+        "bbox": {
+            "x": round(_clamp((bb["x"] - nx0) / cw, 0.01, 0.95), 4),
+            "y": round(_clamp((bb["y"] - ny0) / ch, 0.01, 0.95), 4),
+            "width": round(_clamp(bb["width"] / cw, 0.10, 0.98), 4),
+            "height": round(_clamp(bb["height"] / ch, 0.10, 0.98), 4),
+        },
+        "landmarks": {k: remap(v) for k, v in geom["landmarks"].items()},
+        "contour": [remap(p) for p in geom["contour"]],
+        "t_zone": [remap(p) for p in geom["t_zone"]],
+        "left_cheek_zone": [remap(p) for p in geom["left_cheek_zone"]],
+        "right_cheek_zone": [remap(p) for p in geom["right_cheek_zone"]],
+    }
+    return cropped, new_geom
+
+
+def _apply_face_studio_isolation(arr_rgb: np.ndarray, geom: Dict[str, Any]) -> np.ndarray:
+    """
+    Softly dims non-facial background corners outside the fitted geometry contour
+    so only the tracked face stands out across cropped photo and CV overlays.
+    """
+    h, w, _ = arr_rgb.shape
+    mask = _build_face_oval_mask(w, h, geom, blur_sigma=3.5)[:, :, None]
+    bg_studio = np.array([15.0, 32.0, 74.0], dtype=np.float32)[None, None, :]
+    isolated = arr_rgb.astype(np.float32) * (0.14 + 0.86 * mask) + bg_studio * (1.0 - mask) * 0.76
+    return np.clip(isolated, 0.0, 255.0)
+
+
 def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
     """
     Executes the full Python Computer Vision skin pipeline in pure NumPy + Pillow:
       1. EXIF transpose correction so mobile selfies align upright
-      2. Lighting constancy & Dull Razor artifact suppression
-      3. YCbCr skin probability + Haar-like eye-pair facial geometry fitting
+      2. YCbCr skin probability + Haar-like eye-pair facial geometry fitting
+      3. Tight face-only crop & studio isolation to the detected geometry
       4. Smooth Wood's Lamp 365nm simulation, anatomical mesh & 384+ micro-patch map
     """
     pil_img = Image.open(io.BytesIO(image_bytes))
@@ -691,21 +772,31 @@ def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
 
-    orig_w, orig_h = pil_img.size
-    work_img = pil_img.copy()
+    # Step 1: Detect real face geometry on full upright photo
+    detect_img = pil_img.copy()
+    detect_img.thumbnail((420, 420), Image.Resampling.LANCZOS)
+    detect_rgb = np.array(detect_img, dtype=np.float32)
+    detect_skin = _compute_skin_probability(detect_rgb)
+    raw_geom = _detect_face_geometry(detect_rgb, detect_skin)
+
+    # Step 2: Crop image strictly to the fitted face geometry + re-normalize coords
+    face_pil, geom = _crop_face_to_geometry(pil_img, raw_geom)
+    crop_w, crop_h = face_pil.size
+
+    work_img = face_pil.copy()
     work_img.thumbnail((480, 480), Image.Resampling.LANCZOS)
     rgb = np.array(work_img, dtype=np.uint8)
-
-    raw_float = rgb.astype(np.float32)
-    raw_skin_prob = _compute_skin_probability(raw_float)
-    geom = _detect_face_geometry(raw_float, raw_skin_prob)
 
     norm_rgb = _normalize_lighting_and_dull_razor(rgb)
     skin_prob = _compute_skin_probability(norm_rgb)
 
+    isolated_raw = _apply_face_studio_isolation(rgb.astype(np.float32), geom)
+    isolated_norm = _apply_face_studio_isolation(norm_rgb, geom)
+
     wood_img, wood_metrics = _generate_woodlamp_image(norm_rgb, geom)
-    mesh_img = _generate_geometry_mesh_image(norm_rgb, geom)
-    micro_img = _generate_micro_analysis_image(norm_rgb, skin_prob, geom)
+    mesh_img = _generate_geometry_mesh_image(isolated_norm, geom)
+    micro_img = _generate_micro_analysis_image(isolated_norm, skin_prob, geom)
+    clean_crop_img = Image.fromarray(np.clip(isolated_raw, 0, 255).astype(np.uint8), mode="RGB")
 
     face_mask = _build_face_oval_mask(work_img.width, work_img.height, geom) > 0.5
     skin_cov_pct = round(float(np.mean((skin_prob > 0.25) & face_mask) * 100.0 / max(0.05, float(np.mean(face_mask)))), 1)
@@ -714,8 +805,8 @@ def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
     cv_metrics = {
         **wood_metrics,
         "skin_coverage_pct": skin_cov_pct,
-        "image_width": orig_w,
-        "image_height": orig_h,
+        "image_width": crop_w,
+        "image_height": crop_h,
     }
 
     findings: List[str] = []
@@ -734,6 +825,7 @@ def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
 
     return {
         "face_geometry": geom,
+        "cropped_face_image": _encode_jpeg_data_url(clean_crop_img, max_width=420, quality=86),
         "woodlamp_image": _encode_jpeg_data_url(wood_img, max_width=420, quality=84),
         "geometry_mesh_image": _encode_jpeg_data_url(mesh_img, max_width=420, quality=85),
         "micro_analysis_image": _encode_jpeg_data_url(micro_img, max_width=420, quality=85),
