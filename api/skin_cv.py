@@ -157,30 +157,31 @@ def _detect_face_geometry(rgb: np.ndarray, skin_prob: np.ndarray) -> Dict[str, A
     best_score = -1e9
     best_cfg = None
 
-    # Search eye line (20%..56% height), center X (24%..76% width), half-IPD (11.5%..18.5% width)
-    for half_ipd_norm in (0.115, 0.138, 0.162, 0.185):
+    # Search eye line (18%..64% height), center X (20%..80% width), half-IPD (9.5%..19% width)
+    for half_ipd_norm in (0.095, 0.115, 0.138, 0.162, 0.188):
         d = max(5, int(round(half_ipd_norm * sw)))
         er_y = max(2, int(round(d * 0.28)))
         er_x = max(2, int(round(d * 0.34)))
 
-        cy_min = max(int(sh * 0.18), int(d * 1.05))
-        cy_max = min(int(sh * 0.58), sh - int(d * 1.7))
-        cx_min = max(int(sw * 0.24), int(d * 1.25))
-        cx_max = min(int(sw * 0.76), sw - int(d * 1.25))
+        cy_min = max(int(sh * 0.18), int(d * 1.00))
+        cy_max = min(int(sh * 0.64), sh - int(d * 1.45))
+        cx_min = max(int(sw * 0.20), int(d * 1.15))
+        cx_max = min(int(sw * 0.80), sw - int(d * 1.15))
 
         for ey in range(cy_min, max(cy_min + 1, cy_max), 2):
             for cx in range(cx_min, max(cx_min + 1, cx_max), 2):
-                # Require BOTH eye regions + outer temples to sit inside facial skin, not dark hair/background
-                sk_fh = box_mean(ii_skin, ey - int(d * 0.92), ey - int(d * 0.34), cx - int(d * 0.7), cx + int(d * 0.7))
+                # Require forehead, both orbital areas, nose bridge, and cheeks inside skin region
+                sk_fh = box_mean(ii_skin, ey - int(d * 0.90), ey - int(d * 0.30), cx - int(d * 0.7), cx + int(d * 0.7))
                 sk_eye_l = box_mean(ii_skin, ey - er_y, ey + int(d * 0.55), cx - d - int(d * 0.55), cx - d + int(d * 0.35))
                 sk_eye_r = box_mean(ii_skin, ey - er_y, ey + int(d * 0.55), cx + d - int(d * 0.35), cx + d + int(d * 0.55))
+                sk_bridge = box_mean(ii_skin, ey - er_y, ey + int(d * 0.55), cx - max(2, d // 3), cx + max(2, d // 3))
                 sk_ch = box_mean(ii_skin, ey + int(d * 0.35), ey + int(d * 1.05), cx - int(d * 0.95), cx + int(d * 0.95))
-                if sk_fh < 0.22 or sk_eye_l < 0.28 or sk_eye_r < 0.28 or sk_ch < 0.20:
+                if sk_fh < 0.18 or sk_eye_l < 0.20 or sk_eye_r < 0.20 or sk_bridge < 0.20 or sk_ch < 0.18:
                     continue
 
                 lum_le = box_mean(ii_lum, ey - er_y, ey + er_y, cx - d - er_x, cx - d + er_x)
                 lum_re = box_mean(ii_lum, ey - er_y, ey + er_y, cx + d - er_x, cx + d + er_x)
-                if abs(lum_le - lum_re) > 42.0:
+                if abs(lum_le - lum_re) > 46.0:
                     continue
 
                 lum_bridge = box_mean(ii_lum, ey - er_y, ey + er_y + 1, cx - max(2, d // 4), cx + max(2, d // 4))
@@ -191,52 +192,66 @@ def _detect_face_geometry(rgb: np.ndarray, skin_prob: np.ndarray) -> Dict[str, A
                 # Both eyes must individually be darker than their own cheek and nose bridge
                 left_c = min(lum_cheek_l - lum_le, lum_bridge - lum_le)
                 right_c = min(lum_cheek_r - lum_re, lum_bridge - lum_re)
-                if left_c <= 2.0 or right_c <= 2.0:
+                if left_c <= 1.2 or right_c <= 1.2:
                     continue
 
                 eye_dark_contrast = (
                     min(left_c, right_c) * 1.45
-                    + (lum_fh - 0.5 * (lum_le + lum_re)) * 0.65
+                    + (lum_fh - 0.5 * (lum_le + lum_re)) * 0.60
                     + 0.5 * (left_c + right_c) * 0.55
                 )
-                symmetry_pen = abs(lum_le - lum_re) * 1.25
-                skin_conf = 0.35 + 0.45 * sk_fh + 0.45 * min(sk_eye_l, sk_eye_r)
-                prior = 1.0 - 0.16 * abs((cx / float(sw)) - 0.5)
+                symmetry_pen = abs(lum_le - lum_re) * 1.15
+                skin_conf = 0.25 + 0.55 * sk_fh + 0.55 * min(sk_eye_l, sk_eye_r) + 0.35 * sk_ch
+                prior = 1.0 - 0.08 * abs((cx / float(sw)) - 0.5)
                 score = (eye_dark_contrast - symmetry_pen) * skin_conf * prior
 
                 if score > best_score:
                     best_score = score
                     best_cfg = (cx / float(sw), ey / float(sh), (2.0 * d) / float(sw))
 
-    detected = best_cfg is not None and best_score > 6.0
+    detected = best_cfg is not None and best_score > 3.5
     if detected and best_cfg is not None:
         center_x, eye_y_norm, ipd_w = best_cfg
     else:
-        # Crisp centered fallback proportions
-        center_x = 0.50
-        eye_y_norm = 0.40
-        ipd_w = 0.25
+        # Adaptive skin-centroid fallback (NEVER blind hardcoded 0.50/0.40 if skin region is visible)
+        peak_prob = float(np.max(skin_s)) if skin_s.size else 0.0
+        fg_mask = skin_s > max(0.18, peak_prob * 0.45)
+        ys, xs = np.where(fg_mask)
+        if ys.size > 24:
+            x_lo_s, x_hi_s = float(np.percentile(xs, 10)), float(np.percentile(xs, 90))
+            y_lo_s, y_hi_s = float(np.percentile(ys, 8)), float(np.percentile(ys, 88))
+            center_x = _clamp(0.5 * (x_lo_s + x_hi_s) / float(sw), 0.16, 0.84)
+            face_w_s = max(0.18, (x_hi_s - x_lo_s) / float(sw))
+            face_h_s = max(0.24, (y_hi_s - y_lo_s) / float(sh))
+            eye_y_norm = _clamp((y_lo_s / float(sh)) + 0.30 * face_h_s, 0.16, 0.70)
+            ipd_w = _clamp(face_w_s * 0.43, 0.14, 0.48)
+            detected = True
+        else:
+            center_x = 0.50
+            eye_y_norm = 0.40
+            ipd_w = 0.25
 
     # Convert horizontal IPD (normalized to image width) to vertical proportion using aspect ratio
     ipd_px = ipd_w * float(w)
     half_ipd_px = ipd_px * 0.5
 
-    # Refine individual left/right eye vertical centers within +-0.12*ipd_px
-    ey_px = int(round(eye_y_norm * h))
+    # Refine individual left/right eye pupil centers slightly downward-biased to avoid dark eyebrows
+    ey_px = int(round(eye_y_norm * h)) + max(1, int(round(ipd_px * 0.05)))
     lx_px = int(round((center_x - ipd_w * 0.5) * w))
     rx_px = int(round((center_x + ipd_w * 0.5) * w))
-    v_rad = max(4, int(round(ipd_px * 0.15)))
+    v_up = max(2, int(round(ipd_px * 0.06)))
+    v_dn = max(4, int(round(ipd_px * 0.16)))
     h_rad = max(3, int(round(ipd_px * 0.14)))
 
     left_eye_y_px = ey_px
     right_eye_y_px = ey_px
     if detected:
-        l_y0, l_y1 = max(0, ey_px - v_rad), min(h, ey_px + v_rad)
+        l_y0, l_y1 = max(0, ey_px - v_up), min(h, ey_px + v_dn)
         l_x0, l_x1 = max(0, lx_px - h_rad // 2), min(w, lx_px + h_rad // 2)
         l_win = lum[l_y0:l_y1, l_x0:l_x1]
         if l_win.size > 0:
             left_eye_y_px = l_y0 + int(np.argmin(np.mean(l_win, axis=1)))
-        r_y0, r_y1 = max(0, ey_px - v_rad), min(h, ey_px + v_rad)
+        r_y0, r_y1 = max(0, ey_px - v_up), min(h, ey_px + v_dn)
         r_x0, r_x1 = max(0, rx_px - h_rad // 2), min(w, rx_px + h_rad // 2)
         r_win = lum[r_y0:r_y1, r_x0:r_x1]
         if r_win.size > 0:
@@ -681,9 +696,12 @@ def run_skin_cv_pipeline(image_bytes: bytes) -> Dict[str, Any]:
     work_img.thumbnail((480, 480), Image.Resampling.LANCZOS)
     rgb = np.array(work_img, dtype=np.uint8)
 
+    raw_float = rgb.astype(np.float32)
+    raw_skin_prob = _compute_skin_probability(raw_float)
+    geom = _detect_face_geometry(raw_float, raw_skin_prob)
+
     norm_rgb = _normalize_lighting_and_dull_razor(rgb)
     skin_prob = _compute_skin_probability(norm_rgb)
-    geom = _detect_face_geometry(norm_rgb, skin_prob)
 
     wood_img, wood_metrics = _generate_woodlamp_image(norm_rgb, geom)
     mesh_img = _generate_geometry_mesh_image(norm_rgb, geom)

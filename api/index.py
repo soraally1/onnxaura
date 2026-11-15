@@ -368,6 +368,32 @@ async def scan_skin_json(
         raise HTTPException(status_code=500, detail=f"Gagal menganalisis gambar base64: {str(e)}")
 
 
+@app.post("/api/skin/cv-preview")
+async def preview_skin_cv(payload: Dict[str, Any] = Body(...)):
+    """
+    Fast pure-Python CV endpoint (~100ms, no LLM call) returning auto-fitted
+    face geometry landmarks, Wood's Lamp 365nm simulation, and mesh overlay
+    for the captured photo immediately while clinical diagnosis completes.
+    """
+    image_base64 = payload.get("image_base64") or payload.get("image")
+    if not image_base64:
+        raise HTTPException(status_code=400, detail="Field 'image_base64' wajib diisi.")
+
+    try:
+        from api.skin_cv import run_skin_cv_pipeline
+
+        if "base64," in image_base64:
+            image_base64 = image_base64.split("base64,")[1]
+        image_bytes = base64.b64decode(image_base64)
+        cv_result = run_skin_cv_pipeline(image_bytes)
+        return {
+            "success": True,
+            "cv_analysis": cv_result,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal memproses CV preview wajah: {str(e)}")
+
+
 # =====================================================================
 # SCIN METADATA & TAXONOMY REFERENCE
 # =====================================================================
