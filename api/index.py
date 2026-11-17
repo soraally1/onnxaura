@@ -35,17 +35,19 @@ from api.scin_taxonomy import (
     ENVIRONMENTAL_SCIN_CONDITIONS,
 )
 
-# Lazy-loaded cough runtime (prevents librosa/llvmlite/onnxruntime cold-start failures on skin & health routes)
+# Lazy-loaded cough runtime (prevents onnxruntime cold-start overhead on skin & health routes)
 _cough_session = None
 _dsp_module = None
+_cough_viz_fn = None
 _softmax_fn = None
 
 
 def _get_cough_runtime():
-    global _cough_session, _dsp_module, _softmax_fn
+    global _cough_session, _dsp_module, _cough_viz_fn, _softmax_fn
     if _cough_session is None:
         import onnxruntime as ort
         import api.dsp as dsp_mod
+        from api.cough_viz import build_cough_visualization
         from scipy.special import softmax as scipy_softmax
 
         icbhi_path = os.path.join(os.path.dirname(__file__), "best_icbhi_model.onnx")
@@ -54,8 +56,9 @@ def _get_cough_runtime():
 
         _cough_session = ort.InferenceSession(icbhi_path)
         _dsp_module = dsp_mod
+        _cough_viz_fn = build_cough_visualization
         _softmax_fn = scipy_softmax
-    return _cough_session, _dsp_module, _softmax_fn
+    return _cough_session, _dsp_module, _cough_viz_fn, _softmax_fn
 
 app = FastAPI(
     title="AURA Health AI - Cough & Environmental Skin Analysis API",
@@ -144,16 +147,14 @@ async def process_cough_inference(
         raise HTTPException(status_code=400, detail="Only .wav audio files are supported for cough analysis.")
         
     try:
-        cough_session, dsp, softmax = _get_cough_runtime()
+        cough_session, dsp, build_cough_viz, softmax = _get_cough_runtime()
         audio_bytes = await file.read()
-        mel_spec = dsp.process_audio(audio_bytes) 
-        
-        max_length = 128
-        if mel_spec.shape[1] > max_length:
-            mel_spec = mel_spec[:, :max_length]
-        else:
-            pad_width = max_length - mel_spec.shape[1]
-            mel_spec = np.pad(mel_spec, ((0, 0), (0, pad_width)), mode='constant')
+        try:
+            dsp_result = dsp.process_audio_detailed(audio_bytes)
+        except ValueError as audio_err:
+            raise HTTPException(status_code=400, detail=str(audio_err))
+
+        mel_spec = dsp_result["mel_model"]
             
         # Reshape to (1, 1, 128, 128) and cast to float32
         mel_array = np.array(mel_spec, dtype=np.float32).reshape(1, 1, 128, 128)
@@ -210,17 +211,27 @@ async def process_cough_inference(
                 "clinical_correlation_notes": " ".join(risk_notes)
             }
         
+        all_probs = {
+            label: round(float(probabilities[idx]) * 100, 2)
+            for idx, label in ICBHI_CLASSES.items()
+        }
+        confidence_pct = round(confidence * 100, 2)
+        visualization = build_cough_viz(
+            dsp_result=dsp_result,
+            pred_label=pred_label,
+            confidence_pct=confidence_pct,
+            all_probabilities=all_probs,
+        )
+
         response_data = {
             "prediction": pred_label,
-            "confidence": round(confidence * 100, 2),
+            "confidence": confidence_pct,
             "status": status,
             "health_score": base_score,
             "severity": severity,
             "clinical_interpretation": interpretation,
-            "all_probabilities": {
-                label: round(float(probabilities[idx]) * 100, 2) 
-                for idx, label in ICBHI_CLASSES.items()
-            }
+            "all_probabilities": all_probs,
+            "visualization": visualization,
         }
         if correlation:
             response_data["environmental_correlation"] = correlation
