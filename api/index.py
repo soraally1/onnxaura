@@ -154,6 +154,13 @@ async def process_cough_inference(
         except ValueError as audio_err:
             raise HTTPException(status_code=400, detail=str(audio_err))
 
+        raw_rms = float(np.sqrt(np.mean(dsp_result["y_raw"] ** 2)))
+        if raw_rms < 1e-5:
+            raise HTTPException(
+                status_code=400,
+                detail="Rekaman audio kosong/hening (amplitudo 0 dB). Pastikan mikrofon tidak dibisukan dan coba batuk lebih dekat ke mikrofon.",
+            )
+
         mel_spec = dsp_result["mel_model"]
             
         # Reshape to (1, 1, 128, 128) and cast to float32
