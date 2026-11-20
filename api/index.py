@@ -22,7 +22,7 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Body, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 
@@ -42,13 +42,19 @@ _cough_viz_fn = None
 _softmax_fn = None
 
 
+def _numpy_softmax(logits: np.ndarray) -> np.ndarray:
+    arr = np.asarray(logits, dtype=np.float64)
+    shifted = arr - np.max(arr)
+    exps = np.exp(shifted)
+    return (exps / np.sum(exps)).astype(np.float32)
+
+
 def _get_cough_runtime():
     global _cough_session, _dsp_module, _cough_viz_fn, _softmax_fn
     if _cough_session is None:
         import onnxruntime as ort
         import api.dsp as dsp_mod
         from api.cough_viz import build_cough_visualization
-        from scipy.special import softmax as scipy_softmax
 
         icbhi_path = os.path.join(os.path.dirname(__file__), "best_icbhi_model.onnx")
         if not os.path.exists(icbhi_path):
@@ -57,7 +63,7 @@ def _get_cough_runtime():
         _cough_session = ort.InferenceSession(icbhi_path)
         _dsp_module = dsp_mod
         _cough_viz_fn = build_cough_visualization
-        _softmax_fn = scipy_softmax
+        _softmax_fn = _numpy_softmax
     return _cough_session, _dsp_module, _cough_viz_fn, _softmax_fn
 
 app = FastAPI(
@@ -410,6 +416,64 @@ async def preview_skin_cv(payload: Dict[str, Any] = Body(...)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal memproses CV preview wajah: {str(e)}")
+
+
+# =====================================================================
+# SELF-HOSTED NEURAL INDONESIAN TTS (ONNX Runtime, zero external API)
+# =====================================================================
+@app.get("/api/tts")
+def tts_get(
+    text: str = Query(..., min_length=1, max_length=450),
+    speed: float = Query(1.03, ge=0.75, le=1.4),
+):
+    """Synthesize Indonesian neural speech directly to audio/wav bytes."""
+    try:
+        from api.tts_engine import synthesize_indonesian_wav
+
+        wav_bytes, meta = synthesize_indonesian_wav(text, length_scale=speed)
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={
+                "X-TTS-Model": str(meta["model"]),
+                "X-TTS-Duration": str(meta["duration_sec"]),
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal mensintesis suara TTS: {str(e)}")
+
+
+@app.post("/api/tts")
+def tts_post(payload: Dict[str, Any] = Body(...)):
+    """Synthesize Indonesian neural speech (returns JSON base64 or raw audio/wav)."""
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Field 'text' wajib diisi.")
+    speed = float(payload.get("speed") or 1.03)
+    speed = max(0.75, min(1.4, speed))
+    fmt = str(payload.get("format") or "json").lower()
+
+    try:
+        from api.tts_engine import synthesize_indonesian_wav
+
+        wav_bytes, meta = synthesize_indonesian_wav(text, length_scale=speed)
+        if fmt == "wav":
+            return Response(content=wav_bytes, media_type="audio/wav")
+
+        return {
+            "success": True,
+            "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+            "mime_type": "audio/wav",
+            **meta,
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal mensintesis suara TTS: {str(e)}")
+
 
 
 # =====================================================================

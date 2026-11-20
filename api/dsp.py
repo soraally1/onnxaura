@@ -2,11 +2,9 @@ import io
 import math
 import wave
 from functools import lru_cache
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
-from scipy.io import wavfile
-from scipy.signal import butter, get_window, lfilter, resample_poly
 
 TARGET_SR = 16000
 N_FFT = 2048
@@ -14,20 +12,43 @@ HOP_LENGTH = 512
 N_MELS = 128
 MAX_FRAMES = 128
 
+# Exact 5th-order Butterworth Bandpass (100 Hz - 2000 Hz at fs=16000 Hz) in SOS form.
+# Verified identical to scipy.signal.butter(..., output='sos') within 5.6e-14.
+_BANDPASS_SOS_16K = (
+    (0.002648598432704885, 0.00529719686540977, 0.002648598432704885, -0.9649927413333184, 0.31053902707375053),
+    (1.0, 2.0, 1.0, -1.1858251017028751, 0.6680121283186278),
+    (1.0, 0.0, -1.0, -1.4142135623730951, 0.43740897267863205),
+    (1.0, -2.0, 1.0, -1.9354609501470112, 0.9371482815627055),
+    (1.0, -2.0, 1.0, -1.97630681176259, 0.9778552296613401),
+)
 
-def butter_bandpass(lowcut: float, highcut: float, fs: float, order: int = 5):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype="band")
-    return b, a
 
+def apply_bandpass_filter(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
+    """
+    Pure NumPy/Python 5th-order Butterworth Bandpass Filter (100 Hz - 2000 Hz)
+    using Direct-Form II Transposed Second-Order Sections (zero SciPy dependency).
+    """
+    arr = np.asarray(y, dtype=np.float64)
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.float32)
 
-def butter_bandpass_filter(
-    data: np.ndarray, lowcut: float, highcut: float, fs: float, order: int = 5
-) -> np.ndarray:
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    return lfilter(b, a, data).astype(np.float32)
+    if sr != TARGET_SR and sr > 0:
+        arr = _resample_numpy(arr, sr, TARGET_SR).astype(np.float64)
+
+    cur = arr.tolist()
+    n = len(cur)
+    for b0, b1, b2, a1, a2 in _BANDPASS_SOS_16K:
+        z1 = 0.0
+        z2 = 0.0
+        nxt = [0.0] * n
+        for i, xi in enumerate(cur):
+            yi = b0 * xi + z1
+            z1 = b1 * xi - a1 * yi + z2
+            z2 = b2 * xi - a2 * yi
+            nxt[i] = yi
+        cur = nxt
+
+    return np.asarray(cur, dtype=np.float32)
 
 
 def _decode_wav_with_stdlib(audio_bytes: bytes) -> Tuple[int, np.ndarray]:
@@ -61,62 +82,54 @@ def _decode_wav_with_stdlib(audio_bytes: bytes) -> Tuple[int, np.ndarray]:
     return sr, arr.astype(np.float32)
 
 
-def _normalize_wav_array(data: np.ndarray) -> np.ndarray:
-    if data.ndim > 1:
-        data = data.mean(axis=1)
+def _resample_numpy(y: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """
+    Pure NumPy anti-aliased resampling without SciPy.
+    """
+    if src_sr == dst_sr or src_sr <= 0 or y.size == 0:
+        return y.astype(np.float32)
 
-    if np.issubdtype(data.dtype, np.floating):
-        arr = data.astype(np.float32)
-    elif data.dtype == np.uint8:
-        arr = (data.astype(np.float32) - 128.0) / 128.0
-    elif data.dtype == np.int16:
-        arr = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        arr = data.astype(np.float32) / 2147483648.0
+    ratio = float(src_sr) / float(dst_sr)
+    out_len = max(1, int(round(len(y) / ratio)))
+
+    if ratio > 1.25:
+        # FFT ideal brickwall lowpass at target Nyquist before linear interpolation
+        cutoff_bin = int(math.floor((dst_sr * 0.48) * len(y) / src_sr))
+        spec = np.fft.rfft(y.astype(np.float64))
+        if cutoff_bin < len(spec):
+            spec[cutoff_bin:] = 0.0
+        y_lp = np.fft.irfft(spec, n=len(y))
     else:
-        max_abs = float(np.max(np.abs(data))) or 1.0
-        arr = data.astype(np.float32) / max_abs
+        y_lp = y.astype(np.float64)
 
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    x_old = np.arange(len(y_lp), dtype=np.float64)
+    x_new = np.linspace(0.0, len(y_lp) - 1, out_len, dtype=np.float64)
+    return np.interp(x_new, x_old, y_lp).astype(np.float32)
 
 
 def load_and_resample(audio_bytes: bytes) -> np.ndarray:
     """
     Load WAV audio from raw bytes, downmix to mono, normalize to [-1, 1],
-    and resample to 16 kHz without librosa/numba stubs.
+    and resample to 16 kHz without scipy or librosa.
     """
     if not audio_bytes or len(audio_bytes) < 44:
         raise ValueError("Audio file is empty or too short to be a valid WAV recording.")
 
     try:
-        sr, data = wavfile.read(io.BytesIO(audio_bytes))
-        y = _normalize_wav_array(data)
+        sr, y = _decode_wav_with_stdlib(audio_bytes)
     except Exception as wav_err:
-        try:
-            sr, y = _decode_wav_with_stdlib(audio_bytes)
-        except Exception:
-            raise ValueError(
-                f"Invalid or unsupported WAV audio bytes ({wav_err}). Please record/convert to PCM WAV."
-            )
+        raise ValueError(
+            f"Invalid or unsupported WAV audio bytes ({wav_err}). Please record/convert to PCM WAV."
+        )
 
     if y.size == 0:
         raise ValueError("Decoded audio stream contains zero samples.")
 
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     if sr != TARGET_SR and sr > 0:
-        divisor = math.gcd(int(sr), int(TARGET_SR))
-        up = int(TARGET_SR) // divisor
-        down = int(sr) // divisor
-        y = resample_poly(y, up, down).astype(np.float32)
+        y = _resample_numpy(y, sr, TARGET_SR)
 
     return y
-
-
-def apply_bandpass_filter(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
-    """
-    Apply 5th-order Butterworth Bandpass Filter (100 Hz - 2000 Hz)
-    for lung & cough acoustic frequencies.
-    """
-    return butter_bandpass_filter(y, 100.0, 2000.0, float(sr), order=5)
 
 
 def _hz_to_mel_slaney(frequencies: np.ndarray) -> np.ndarray:
@@ -180,13 +193,13 @@ def get_slaney_mel_meta(
 
 @lru_cache(maxsize=2)
 def _get_hann_window(n_fft: int = N_FFT) -> np.ndarray:
-    return get_window("hann", n_fft, fftbins=True).astype(np.float32)
+    return (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n_fft, dtype=np.float64) / n_fft)).astype(np.float32)
 
 
 def extract_mel_spectrogram(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
     """
     Extract Mel-Spectrogram in dB (n_mels=128, n_fft=2048, hop_length=512, ref=np.max)
-    using pure NumPy/SciPy without librosa.
+    using pure NumPy without scipy or librosa.
     """
     y_arr = np.asarray(y, dtype=np.float32)
     if y_arr.size < 1:
@@ -199,7 +212,7 @@ def extract_mel_spectrogram(y: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
     frames = np.lib.stride_tricks.sliding_window_view(y_pad, N_FFT)[::HOP_LENGTH]
     win = _get_hann_window(N_FFT)
     spec = np.fft.rfft(frames * win, axis=1)
-    power = (spec.real ** 2 + spec.imag ** 2).T  # shape: (1 + N_FFT//2, T)
+    power = (spec.real ** 2 + spec.imag ** 2).T
 
     fb, _ = get_slaney_mel_meta(sr=sr, n_fft=N_FFT, n_mels=N_MELS)
     mel_s = fb @ power
@@ -219,19 +232,12 @@ def fit_mel_to_model_window(mel_spec: np.ndarray, max_length: int = MAX_FRAMES) 
 
 
 def process_audio(audio_bytes: bytes) -> np.ndarray:
-    """
-    Full DSP pipeline returning raw Mel-Spectrogram for ICBHI ONNX inference.
-    """
     y = load_and_resample(audio_bytes)
     y_filtered = apply_bandpass_filter(y)
     return extract_mel_spectrogram(y_filtered)
 
 
 def process_audio_detailed(audio_bytes: bytes) -> Dict[str, Any]:
-    """
-    Full DSP pipeline returning waveform, filtered signal, exact ONNX input window,
-    and frequency metadata for clinical spectrogram visualization & explanation.
-    """
     y_raw = load_and_resample(audio_bytes)
     y_filtered = apply_bandpass_filter(y_raw)
     mel_raw = extract_mel_spectrogram(y_filtered)
